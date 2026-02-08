@@ -13,6 +13,7 @@ env/
 
 # PyTorch checkpoints & models
 checkpoints/
+old_ckpts/
 *.pt
 *.pth
 *.ckpt
@@ -33,6 +34,9 @@ tensorboard/
 *.swo
 *~
 .DS_Store
+
+# Claude Code
+.claude/
 
 # Test outputs
 test_output/
