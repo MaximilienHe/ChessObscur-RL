@@ -8,8 +8,8 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
-ENV/
-env/
+# ENV/
+# env/
 
 # PyTorch checkpoints & models
 checkpoints/
