@@ -5,7 +5,7 @@ Le serveur Node.js appelle ce service pour obtenir les coups de l'IA.
 
 Usage:
     pip install fastapi uvicorn torch
-    python ai_server.py --checkpoint checkpoints/step_100000.pt --port 8100
+    python ai_server.py --checkpoint checkpoints/step_36962304.pt --port 8100
 
 Endpoints:
     POST /move       — demande un coup (phase move ou parry_move)
@@ -204,10 +204,23 @@ def load_model(checkpoint_path: str, dev: str = "cpu"):
     ).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Extract state dict
     if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
+        state_dict = ckpt["model_state_dict"]
     else:
-        model.load_state_dict(ckpt)
+        state_dict = ckpt
+
+    # Remove _orig_mod. prefix if present (from torch.compile)
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("_orig_mod."):
+            new_key = key.replace("_orig_mod.", "")
+            new_state_dict[new_key] = value
+        else:
+            new_state_dict[key] = value
+
+    model.load_state_dict(new_state_dict)
     model.eval()
     print(f"[ai] Modèle chargé: {checkpoint_path} sur {device}")
 
