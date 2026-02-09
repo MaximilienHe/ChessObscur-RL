@@ -22,6 +22,7 @@ from env.reward import (
     REWARD_CAPTURE_SCALE, REWARD_LOSE_PIECE_SCALE,
     REWARD_CHECK_GIVEN, REWARD_BLOCK_SUCCESS, REWARD_PARRY_SUCCESS,
     REWARD_DEFENSE_FAIL, REWARD_ACCEPT_LOSS, REWARD_PARRY_MOVE_GOOD,
+    REWARD_PARRY_SKIP,
     REWARD_STEP_PENALTY, REWARD_CHECK_ATTEMPT_PENALTY,
 )
 
@@ -449,6 +450,10 @@ class ChessObscurEnv:
 
             pf = pm.view(M, 4096)
             pf = self._filter_king_safety_batched(bds, pf, pc_is_w, self.en_passant[idx])
+            for mi_idx in range(M):
+                sq = p_sq[mi_idx].item()
+                skip_action = sq * 64 + sq  # from==to
+                pf[mi_idx, skip_action] = True
             mask[in_parry, :4096] = pf
 
         return mask
@@ -591,12 +596,26 @@ class ChessObscurEnv:
                 ic=True; cs=(ts%8)+(fs//8)*8; tgt=bd[cs].item(); bd[cs]=EMPTY
             if parry:
                 cw=self.parry_controller_is_white[i].item()
+
+                # ── FIX: check if this is a "parry skip" (from==to, encoded as same square) ──
+                if fs == ts:
+                    # Skip parry — don't move the piece
+                    self.phase[i]=PHASE_MOVE; self.parry_square[i]=-1
+                    reward[i]+=REWARD_PARRY_SKIP
+                    self._enforce_check(i,cw,reward); continue
+
                 if ic:
                     tw=1<=tgt<=6
                     if cw==tw:
+                        # Self-capture: controller eats their own piece
+                        # ── FIX: NEGATIVE reward scaled by piece value instead of positive ──
+                        dt = (tgt-1) if tgt<=6 else (tgt-7)
+                        piece_val = self.tables.piece_values[dt].item()
+
                         bd[ts]=bd[fs]; bd[fs]=EMPTY; self._post_move_updates(i,fs,ts)
                         self.phase[i]=PHASE_MOVE; self.parry_square[i]=-1
-                        reward[i]+=REWARD_PARRY_MOVE_GOOD; self.half_moves[i]=0
+                        reward[i] += REWARD_PARRY_SELF_CAPTURE * piece_val  # negative!
+                        self.half_moves[i]=0
                         self._enforce_check(i,cw,reward); continue
                     else:
                         self._start_defense(i,fs,ts,mv,tgt,cw); continue
@@ -605,6 +624,7 @@ class ChessObscurEnv:
                     self.phase[i]=PHASE_MOVE; self.parry_square[i]=-1
                     reward[i]+=REWARD_PARRY_MOVE_GOOD
                     self._enforce_check(i,cw,reward); continue
+
             if ic:
                 self._start_defense(i,fs,ts,mv,tgt,mw)
             else:

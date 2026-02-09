@@ -8,10 +8,9 @@ Rewards are designed to guide the agent toward:
 4. Efficient check resolution
 5. Controlling center, development (light shaping)
 
-CHANGES from v1:
-- Increased intermediate reward magnitudes (were too small relative to noise)
-- Added REWARD_GIVE_CHECK for successfully giving check
-- Clarified sign conventions
+CHANGES from v2:
+- REWARD_PARRY_SELF_CAPTURE: negative reward scaled by piece value (was +0.03!)
+- REWARD_PARRY_SKIP: small positive reward for choosing not to move (new action)
 """
 import torch
 from env.move_tables import EMPTY
@@ -23,17 +22,18 @@ REWARD_LOSE = -1.0
 REWARD_DRAW = -0.3
 
 # ── Intermediate shaping ──
-# CHANGED: bumped from 0.02 → 0.05 etc. so gradient signal is meaningful
 REWARD_CAPTURE_SCALE = 0.10          # * piece_value of captured piece (positive for capturer)
 REWARD_LOSE_PIECE_SCALE = -0.10      # * piece_value of own piece lost (negative for loser)
-REWARD_CHECK_GIVEN = 0.08            # giving check (was unused before, now wired in)
+REWARD_CHECK_GIVEN = 0.08            # giving check
 REWARD_BLOCK_SUCCESS = 0.06          # successfully blocked a capture
 REWARD_PARRY_SUCCESS = 0.12          # parry is harder, reward more
 REWARD_DEFENSE_FAIL = -0.01          # tried to defend but failed
 REWARD_ACCEPT_LOSS = -0.02           # accepted loss without trying
-REWARD_PARRY_MOVE_GOOD = 0.03       # made a useful parry move
+REWARD_PARRY_MOVE_GOOD = 0.03       # made a useful parry move (non-capture, non-self)
+REWARD_PARRY_SELF_CAPTURE = -0.08    # NEW: penalty for eating your own piece during parry (* piece_value)
+REWARD_PARRY_SKIP = 0.005           # NEW: small reward for choosing to skip parry (neutral/safe)
 REWARD_CHECK_ATTEMPT_PENALTY = -0.05 # each wasted check attempt (3-check rule)
-REWARD_STEP_PENALTY = -0.003         # CHANGED: slightly stronger to push toward finishing
+REWARD_STEP_PENALTY = -0.003         # slightly stronger to push toward finishing
 
 
 def compute_material(board: torch.Tensor, piece_values: torch.Tensor, 
@@ -94,36 +94,25 @@ def reward_terminal(result_code: torch.Tensor, active_is_white: torch.Tensor,
     reward = torch.where(white_wins & ~active_is_white,
                          torch.tensor(REWARD_LOSE, device=reward.device), reward)
 
-    # Draws — differentiate based on material advantage for timeout draws
+    # Draws
     if draws.any():
-        # Detect timeout draws (max game length reached)
         timeout_draws = draws.clone()
         if full_move_count is not None:
             timeout_draws = draws & (full_move_count >= max_steps * 2)
         else:
             timeout_draws = torch.zeros_like(draws)
 
-        # Non-timeout draws (stalemate, 50-move rule) — standard penalty
         other_draws = draws & ~timeout_draws
         reward = torch.where(other_draws, torch.tensor(REWARD_DRAW, device=reward.device), reward)
 
-        # Timeout draws — material-based reward
         if timeout_draws.any() and board is not None and piece_values is not None:
             material_advantage = compute_material(board, piece_values, active_is_white)
-
-            # Reward formula: base penalty + bonus/malus based on material advantage
-            # -0.5 to -0.1 range, scaled by tanh of material advantage
-            # Example: +10 material (queen advantage) → ~-0.15
-            #          -10 material → ~-0.45
-            #          0 material → -0.3
             base_draw_reward = -0.3
-            material_scale = 0.2  # ±0.2 variation based on material
+            material_scale = 0.2
             normalized_advantage = torch.tanh(material_advantage / 10.0)
             timeout_reward = base_draw_reward + material_scale * normalized_advantage
-
             reward = torch.where(timeout_draws, timeout_reward, reward)
         else:
-            # Fallback if material info not available
             reward = torch.where(timeout_draws, torch.tensor(REWARD_DRAW, device=reward.device), reward)
 
     return reward
