@@ -1,10 +1,9 @@
 """
 self_play.py — Self-play rollout collection.
 
-CHANGES from v1:
-- Track game lengths properly
-- Compute agent win rate (not just white/black wins)
-- Log more diagnostic metrics
+CHANGES from v2:
+- Track per-color rewards (white_reward, black_reward) for TensorBoard
+- Agent win rate tracked properly
 """
 import torch
 import time
@@ -72,7 +71,13 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
     black_wins = 0
     draws = 0
 
-    # NEW: track phases seen, defense actions, etc.
+    # NEW: track per-color cumulative rewards
+    white_reward_sum = 0.0
+    black_reward_sum = 0.0
+    white_reward_count = 0
+    black_reward_count = 0
+
+    # Diagnostic metrics
     defense_phases_seen = 0
     parry_phases_seen = 0
     move_phases_seen = 0
@@ -103,6 +108,16 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
 
             buffer.insert(obs, action, log_prob, reward, done, value, legal_mask)
 
+            # ── NEW: accumulate per-color rewards ──
+            agent_w = env.agent_is_white  # (N,) bool — which color is "the agent" in each env
+            white_mask = agent_w
+            black_mask = ~agent_w
+
+            white_reward_sum += reward[white_mask].sum().item()
+            black_reward_sum += reward[black_mask].sum().item()
+            white_reward_count += white_mask.sum().item()
+            black_reward_count += black_mask.sum().item()
+
             # Track stats
             if done.any():
                 n_done = done.sum().item()
@@ -129,15 +144,17 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
         "rollout/white_wins": white_wins,
         "rollout/black_wins": black_wins,
         "rollout/draws": draws,
-        # NEW: diagnostic metrics
+        # Diagnostic metrics
         "rollout/phase_move_frac": move_phases_seen / total_steps,
         "rollout/phase_defense_frac": defense_phases_seen / total_steps,
         "rollout/phase_parry_frac": parry_phases_seen / total_steps,
         "rollout/avg_legal_actions": total_legal_actions / total_steps,
+        # ── NEW: per-color rewards ──
+        "rollout/white_mean_reward": white_reward_sum / max(white_reward_count, 1),
+        "rollout/black_mean_reward": black_reward_sum / max(black_reward_count, 1),
     }
 
     if games_completed > 0:
-        # CHANGED: win_rate now means "decisive game rate" (not draw)
         stats["game/win_rate"] = (white_wins + black_wins) / games_completed
         stats["game/draw_rate"] = draws / games_completed
         stats["game/white_win_rate"] = white_wins / games_completed

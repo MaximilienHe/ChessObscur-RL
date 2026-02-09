@@ -22,6 +22,8 @@ class PPOTrainer:
         if self.use_amp:
             print(f"[ppo] AMP enabled (mixed precision)")
 
+        # ── NEW: track current entropy coef for logging ──
+        self._current_entropy_coef = config.entropy_coef
 
     def compute_gae(self, rewards: torch.Tensor, values: torch.Tensor,
                     dones: torch.Tensor, next_value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -46,8 +48,18 @@ class PPOTrainer:
         returns = advantages + values
         return advantages, returns
 
-    def update(self, rollout: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    def update(self, rollout: Dict[str, torch.Tensor], global_step: int = 0) -> Dict[str, float]:
+        """
+        PPO update.
+        
+        CHANGED: accepts global_step to compute dynamic entropy_coef.
+        """
         cfg = self.cfg
+
+        # ── NEW: dynamic entropy coefficient decay ──
+        entropy_coef = cfg.get_entropy_coef(global_step)
+        self._current_entropy_coef = entropy_coef
+
         oom_errors = (torch.OutOfMemoryError,)
         if hasattr(torch, "AcceleratorError"):
             oom_errors = oom_errors + (torch.AcceleratorError,)
@@ -140,7 +152,8 @@ class PPOTrainer:
 
                                 entropy_loss = entropy.mean()
 
-                                loss = pg_loss + cfg.value_coef * v_loss - cfg.entropy_coef * entropy_loss
+                                # ── CHANGED: use dynamic entropy_coef ──
+                                loss = pg_loss + cfg.value_coef * v_loss - entropy_coef * entropy_loss
 
                             # Scaled backward pass
                             self.scaler.scale(loss * micro_weight).backward()
@@ -187,6 +200,7 @@ class PPOTrainer:
             "loss/entropy": total_entropy / max(n_updates, 1),
             "ppo/clipfrac": total_clipfrac / max(n_updates, 1),
             "ppo/approx_kl": total_approx_kl / max(n_updates, 1),
+            "ppo/entropy_coef": entropy_coef,  # NEW: log current entropy coef
         }
 
         return metrics

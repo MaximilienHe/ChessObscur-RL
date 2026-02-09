@@ -22,8 +22,9 @@ class Config:
     # ── Curriculum: progressive max_steps increase ──
     curriculum_enabled: bool = True
     curriculum_start_steps: int = 120      # starting max_steps
-    curriculum_step_increase: int = 30     # increase by this amount
+    curriculum_step_increase: int = 15     # CHANGED: 30 → 15, transition plus douce
     curriculum_every_n_timesteps: int = 5_000_000  # every 5M timesteps
+    curriculum_max_steps_cap: int = 300    # NEW: ne jamais dépasser 300 steps
 
     # ── Observation ──
     obs_planes: int = 19
@@ -53,7 +54,9 @@ class Config:
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     clip_value: float = 0.5
-    entropy_coef: float = 0.003
+    entropy_coef: float = 0.003           # valeur initiale
+    entropy_coef_min: float = 0.0005      # NEW: plancher du decay
+    entropy_coef_decay_steps: int = 100_000_000  # NEW: atteint le min à ce step
     value_coef: float = 1.0
     max_grad_norm: float = 0.5
     ppo_epochs: int = 4
@@ -99,3 +102,10 @@ class Config:
             self.microbatch_size = min(2048, self.minibatch_size)
         else:
             self.microbatch_size = min(self.microbatch_size, self.minibatch_size)
+
+    def get_entropy_coef(self, global_step: int) -> float:
+        """Decay linéaire de l'entropy coef de entropy_coef vers entropy_coef_min."""
+        if global_step >= self.entropy_coef_decay_steps:
+            return self.entropy_coef_min
+        progress = global_step / self.entropy_coef_decay_steps
+        return self.entropy_coef + (self.entropy_coef_min - self.entropy_coef) * progress

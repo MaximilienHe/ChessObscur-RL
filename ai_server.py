@@ -8,8 +8,7 @@ Usage:
     python ai_server.py --checkpoint checkpoints/step_36962304.pt --port 8100
 
 Endpoints:
-    POST /move       — demande un coup (phase move ou parry_move)
-    POST /defense    — demande une action de défense (phase defense)
+    POST /move       — demande un coup (phase move, parry_move ou defense)
     GET  /health     — health check
 """
 import argparse
@@ -21,7 +20,6 @@ from typing import Optional, List, Dict
 import uvicorn
 
 # ── Imports du projet RL ──
-# Ajuster le sys.path si nécessaire
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -31,6 +29,14 @@ from config import Config
 # ─────────────────────────────────────────────
 #  Pydantic models pour l'API
 # ─────────────────────────────────────────────
+
+class QteZones(BaseModel):
+    """Zones QTE envoyées par server.js."""
+    blockStartMs: int = 0
+    blockEndMs: int = 0
+    parryStartMs: int = 0
+    parryEndMs: int = 0
+
 
 class MoveRequest(BaseModel):
     """État du jeu envoyé par server.js pour demander un coup."""
@@ -53,6 +59,10 @@ class MoveRequest(BaseModel):
     pendingAttackerPiece: Optional[str] = None
     pendingDefenderPiece: Optional[str] = None
 
+    # ── FIX: zones QTE transmises par ai_client.js ──
+    qteZones: Optional[QteZones] = None
+    qteDurationMs: Optional[int] = 2000
+
 
 class MoveResponse(BaseModel):
     """Réponse de l'IA."""
@@ -68,7 +78,6 @@ class MoveResponse(BaseModel):
 #  Conversion état JS → observation tensor
 # ─────────────────────────────────────────────
 
-# Mapping pièces JS → codes int (même encoding que move_tables.py)
 PIECE_TO_INT = {
     "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
     "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
@@ -159,7 +168,6 @@ def build_legal_mask_from_request(req: MoveRequest) -> torch.Tensor:
         for mv in moves:
             to_idx = mv.get("to", -1)
             if isinstance(to_idx, str):
-                # Si c'est en notation algébrique
                 f = ord(to_idx[0]) - ord('a')
                 r = int(to_idx[1]) - 1
                 to_idx = f + r * 8
@@ -181,13 +189,50 @@ def idx_to_sq(idx: int) -> str:
 
 
 # ─────────────────────────────────────────────
+#  FIX: Calcul intelligent du stopMs à partir des zones QTE
+# ─────────────────────────────────────────────
+
+def compute_stop_ms_for_zone(action: int, zones: Optional[QteZones], duration_ms: int = 2000) -> Optional[int]:
+    """
+    Place le stopMs au MILIEU de la zone QTE correcte.
+    
+    En entraînement, le modèle choisit BLOCK ou PARRY comme action discrète.
+    En production, on doit convertir ça en un stopMs qui tombe dans la bonne zone.
+    
+    Si les zones ne sont pas fournies, utilise un fallback raisonnable.
+    """
+    if action == 4162:
+        # ACCEPT_LOSS — pas de stopMs
+        return None
+
+    if zones is not None:
+        if action == 4160:
+            # ATTEMPT_BLOCK → milieu de la zone de blocage
+            mid = (zones.blockStartMs + zones.blockEndMs) // 2
+            return max(0, min(duration_ms, mid))
+        elif action == 4161:
+            # ATTEMPT_PARRY → milieu de la zone de parade
+            mid = (zones.parryStartMs + zones.parryEndMs) // 2
+            return max(0, min(duration_ms, mid))
+
+    # Fallback: pas de zones fournies, placer à 80% / 95% de la durée
+    # C'est moins fiable mais mieux que des valeurs fixes
+    if action == 4160:
+        return int(duration_ms * 0.80)
+    elif action == 4161:
+        return int(duration_ms * 0.95)
+
+    return None
+
+
+# ─────────────────────────────────────────────
 #  Chargement du modèle
 # ─────────────────────────────────────────────
 
 app = FastAPI(title="Chess Obscur AI")
 model: ChessObscurNetwork = None
 device: torch.device = None
-temperature: float = 0.5  # contrôle l'exploration (0 = greedy, >0 = stochastique)
+temperature: float = 0.5
 
 
 def load_model(checkpoint_path: str, dev: str = "cpu"):
@@ -254,49 +299,53 @@ def get_move(req: MoveRequest):
 
     # Décoder l'action
     if req.phase == "defense":
-        return _decode_defense_action(action)
+        return _decode_defense_action(action, req.qteZones, req.qteDurationMs or 2000)
     else:
         return _decode_board_action(action)
 
 
-def _decode_defense_action(action: int) -> MoveResponse:
-    """Décode une action de défense."""
+def _decode_defense_action(action: int, zones: Optional[QteZones] = None,
+                           duration_ms: int = 2000) -> MoveResponse:
+    """
+    Décode une action de défense.
+    
+    FIX: Utilise les zones QTE transmises par le serveur pour placer
+    le stopMs au bon endroit au lieu de valeurs fixes.
+    """
+    stop_ms = compute_stop_ms_for_zone(action, zones, duration_ms)
+
     if action == 4160:
-        # ATTEMPT_BLOCK → stop dans la zone de blocage
+        # ATTEMPT_BLOCK
         return MoveResponse(
             action="defense",
             defenseAction="stop",
-            stopMs=1650  # milieu de la zone de blocage typique
+            stopMs=stop_ms,
         )
     elif action == 4161:
-        # ATTEMPT_PARRY → stop dans la zone de parade
+        # ATTEMPT_PARRY
         return MoveResponse(
             action="defense",
             defenseAction="stop",
-            stopMs=1950  # milieu de la zone de parade typique
+            stopMs=stop_ms,
         )
     else:
         # ACCEPT_LOSS
         return MoveResponse(
             action="defense",
-            defenseAction="accept_loss"
+            defenseAction="accept_loss",
         )
 
 
 def _decode_board_action(action: int) -> MoveResponse:
     """Décode une action de mouvement sur le plateau."""
     if action >= 4096:
-        # Underpromotion ou défense (ne devrait pas arriver ici)
         return MoveResponse(action="move", fromSq="a1", toSq="a1")
 
     from_sq = action // 64
     to_sq = action % 64
 
-    # Détecter si c'est une promotion (pion arrivant en rangée 8 ou 1)
     to_rank = to_sq // 8
     promotion = None
-    # La promotion est gérée côté serveur, on envoie "q" par défaut
-    # si le pion arrive en dernière rangée
     if to_rank == 7 or to_rank == 0:
         promotion = "q"
 

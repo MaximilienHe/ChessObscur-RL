@@ -1,5 +1,10 @@
 """
 train.py — Main continuous training loop for Chess Obscur PPO.
+
+CHANGES:
+- Pass global_step to ppo.update() for entropy decay
+- Cap curriculum at curriculum_max_steps_cap
+- Log per-color rewards and entropy_coef to TensorBoard
 """
 import os
 import sys
@@ -158,6 +163,8 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
     print(f"  Microbatch: {cfg.microbatch_size}")
     print(f"  PPO epochs: {cfg.ppo_epochs}")
     print(f"  Max game steps: {cfg.max_game_steps}")
+    print(f"  Curriculum cap: {cfg.curriculum_max_steps_cap}")
+    print(f"  Entropy coef: {cfg.entropy_coef} → {cfg.entropy_coef_min} over {cfg.entropy_coef_decay_steps:,} steps")
     print(f"  Total steps: {cfg.total_timesteps:,}")
     print(f"{'='*60}\n")
 
@@ -239,15 +246,17 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
             obs, rollout_stats = collect_rollout(env, network, buffer, obs, use_amp=cfg.use_amp)
             rollout_data = buffer.get(next_obs=obs)
 
-            ppo_metrics = ppo.update(rollout_data)
+            # ── CHANGED: pass global_step for entropy decay ──
+            ppo_metrics = ppo.update(rollout_data, global_step=global_step)
 
             global_step += cfg.batch_size
             total_games += int(rollout_stats.get("rollout/games_completed", 0))
 
-            # Curriculum: progressively increase max_steps
+            # ── CHANGED: curriculum with cap ──
             if cfg.curriculum_enabled:
-                current_max_steps = cfg.curriculum_start_steps + \
+                raw_max_steps = cfg.curriculum_start_steps + \
                     (global_step // cfg.curriculum_every_n_timesteps) * cfg.curriculum_step_increase
+                current_max_steps = min(raw_max_steps, cfg.curriculum_max_steps_cap)
                 if current_max_steps != env.max_steps:
                     env.set_max_steps(current_max_steps)
                     print(f"[curriculum] Updated max_steps: {env.max_steps} → {current_max_steps} at step {global_step:,}")
