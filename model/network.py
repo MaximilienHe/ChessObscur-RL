@@ -80,7 +80,8 @@ class ChessObscurNetwork(nn.Module):
         policy_logits = self.policy_fc(p)
 
         if legal_mask is not None:
-            policy_logits = policy_logits.masked_fill(~legal_mask, -1e8)
+            # Use -1e4 instead of -1e8 for float16 compatibility (AMP)
+            policy_logits = policy_logits.masked_fill(~legal_mask, -1e4)
 
         v = self.value_conv(x)
         v = v.view(v.size(0), -1)

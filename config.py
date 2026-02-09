@@ -10,8 +10,13 @@ class Config:
     # ── Device ──
     device: str = "cuda"
 
+    # ── Performance Optimization ──
+    use_compile: bool = True       # torch.compile() for faster inference
+    use_amp: bool = True           # Automatic Mixed Precision (float16)
+    compile_mode: str = "default"  # default, reduce-overhead, max-autotune
+
     # ── Environment ──
-    num_envs: int = 512          # parallel games on GPU (increase to 1024/2048 on 5090)
+    num_envs: int = 2048         # parallel games on GPU (2048-4096 optimal on 5090)
     max_game_steps: int = 120     # initial max steps before timeout draw
 
     # ── Curriculum: progressive max_steps increase ──
@@ -52,13 +57,13 @@ class Config:
     value_coef: float = 1.0
     max_grad_norm: float = 0.5
     ppo_epochs: int = 4
-    num_minibatches: int = 8
+    num_minibatches: int = 4         # reduced from 8 for larger minibatches
 
     # ── Rollout ──
     rollout_steps: int = 256         # steps per env before PPO update
     batch_size: int = -1             # computed = num_envs * rollout_steps
     minibatch_size: int = -1         # computed = batch_size / num_minibatches
-    microbatch_size: int = -1        # if <=0, auto-tune to keep VRAM usage safe
+    microbatch_size: int = 8192      # larger for RTX 5090 (was 2048)
 
     # ── Training schedule ──
     total_timesteps: int = 500_000_000  # very long — continuous training
