@@ -173,8 +173,9 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
     param_count = sum(p.numel() for p in network.parameters())
     print(f"[network] Parameters: {param_count:,}")
 
-    ppo = PPOTrainer(network, cfg)
+    # Load checkpoint BEFORE compiling (to avoid _orig_mod prefix mismatch)
     global_step = 0
+    optimizer_state = None
 
     if resume:
         if resume == "latest":
@@ -183,11 +184,28 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
             ckpt_path = resume
 
         if ckpt_path and os.path.exists(ckpt_path):
-            ckpt_data = load_checkpoint(ckpt_path, network, ppo.optimizer, device)
+            # Create temporary optimizer just for loading state
+            temp_optimizer = torch.optim.Adam(network.parameters(), lr=cfg.lr, eps=1e-5)
+            ckpt_data = load_checkpoint(ckpt_path, network, temp_optimizer, device)
             global_step = ckpt_data.get("global_step", 0)
+            optimizer_state = temp_optimizer.state_dict()
             print(f"[resume] Resuming from step {global_step}")
         else:
             print(f"[resume] No checkpoint found at '{resume}', starting fresh")
+
+    # Apply torch.compile() AFTER loading checkpoint
+    if cfg.use_compile and device == "cuda":
+        print(f"[network] Compiling with mode='{cfg.compile_mode}'...")
+        network = torch.compile(network, mode=cfg.compile_mode)
+        print(f"[network] Model compiled successfully")
+
+    # Create PPO trainer after compilation
+    ppo = PPOTrainer(network, cfg)
+
+    # Restore optimizer state if we resumed
+    if optimizer_state is not None:
+        ppo.optimizer.load_state_dict(optimizer_state)
+        print(f"[resume] Optimizer state restored")
 
     if warmstart and os.path.exists(warmstart):
         warmstart_from_human_data(network, warmstart, cfg)
@@ -218,7 +236,7 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
             progress = global_step / cfg.total_timesteps
             ppo.update_lr(progress)
 
-            obs, rollout_stats = collect_rollout(env, network, buffer, obs)
+            obs, rollout_stats = collect_rollout(env, network, buffer, obs, use_amp=cfg.use_amp)
             rollout_data = buffer.get(next_obs=obs)
 
             ppo_metrics = ppo.update(rollout_data)
@@ -293,6 +311,12 @@ def parse_args():
     parser.add_argument("--num-filters", type=int, default=None)
     parser.add_argument("--eval-games", type=int, default=None)
     parser.add_argument("--max-game-steps", type=int, default=None)
+    # Performance optimizations
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile()")
+    parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
+    parser.add_argument("--compile-mode", type=str, default=None,
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile() mode")
     return parser.parse_args()
 
 
@@ -311,6 +335,10 @@ def main():
     if args.num_filters is not None: cfg.num_filters = args.num_filters
     if args.eval_games is not None: cfg.eval_games = args.eval_games
     if args.max_game_steps is not None: cfg.max_game_steps = args.max_game_steps
+    # Performance flags
+    if args.no_compile: cfg.use_compile = False
+    if args.no_amp: cfg.use_amp = False
+    if args.compile_mode is not None: cfg.compile_mode = args.compile_mode
 
     cfg.__post_init__()
 

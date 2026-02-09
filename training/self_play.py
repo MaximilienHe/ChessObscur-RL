@@ -59,7 +59,8 @@ class RolloutBuffer:
 
 
 def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
-                    buffer: RolloutBuffer, obs: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+                    buffer: RolloutBuffer, obs: torch.Tensor,
+                    use_amp: bool = False) -> Tuple[torch.Tensor, Dict]:
     """
     Collect T steps of self-play experience.
     Returns: (next_obs, stats_dict)
@@ -94,7 +95,9 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
             if no_legal.any():
                 legal_mask[no_legal, 4162] = True
 
-            action, log_prob, entropy, value = network.get_action_and_value(obs, legal_mask)
+            # Use AMP for inference if enabled
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                action, log_prob, entropy, value = network.get_action_and_value(obs, legal_mask)
 
             next_obs, reward, done, info = env.step(action)
 

@@ -16,6 +16,13 @@ class PPOTrainer:
         self.optimizer = optim.Adam(network.parameters(), lr=config.lr, eps=1e-5)
         self.lr_scheduler = None
 
+        # Mixed precision support
+        self.use_amp = config.use_amp and config.device == "cuda"
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+        if self.use_amp:
+            print(f"[ppo] AMP enabled (mixed precision)")
+
+
     def compute_gae(self, rewards: torch.Tensor, values: torch.Tensor,
                     dones: torch.Tensor, next_value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         T, N = rewards.shape
@@ -106,33 +113,37 @@ class PPOTrainer:
                             mb_old_values = b_values[micro_idx]
                             mb_legal = b_legal_masks[micro_idx]
 
-                            _, new_log_probs, entropy, new_values = self.net.get_action_and_value(
-                                mb_obs, mb_legal, mb_actions
-                            )
-
-                            log_ratio = new_log_probs - mb_old_log_probs
-                            ratio = torch.exp(log_ratio)
-
-                            pg_loss1 = -mb_advantages * ratio
-                            pg_loss2 = -mb_advantages * torch.clamp(
-                                ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps
-                            )
-                            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                            if cfg.clip_value > 0:
-                                v_clipped = mb_old_values + torch.clamp(
-                                    new_values - mb_old_values, -cfg.clip_value, cfg.clip_value
+                            # Mixed precision forward pass
+                            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                                _, new_log_probs, entropy, new_values = self.net.get_action_and_value(
+                                    mb_obs, mb_legal, mb_actions
                                 )
-                                v_loss1 = (new_values - mb_returns) ** 2
-                                v_loss2 = (v_clipped - mb_returns) ** 2
-                                v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
-                            else:
-                                v_loss = 0.5 * ((new_values - mb_returns) ** 2).mean()
 
-                            entropy_loss = entropy.mean()
+                                log_ratio = new_log_probs - mb_old_log_probs
+                                ratio = torch.exp(log_ratio)
 
-                            loss = pg_loss + cfg.value_coef * v_loss - cfg.entropy_coef * entropy_loss
-                            (loss * micro_weight).backward()
+                                pg_loss1 = -mb_advantages * ratio
+                                pg_loss2 = -mb_advantages * torch.clamp(
+                                    ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps
+                                )
+                                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                                if cfg.clip_value > 0:
+                                    v_clipped = mb_old_values + torch.clamp(
+                                        new_values - mb_old_values, -cfg.clip_value, cfg.clip_value
+                                    )
+                                    v_loss1 = (new_values - mb_returns) ** 2
+                                    v_loss2 = (v_clipped - mb_returns) ** 2
+                                    v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+                                else:
+                                    v_loss = 0.5 * ((new_values - mb_returns) ** 2).mean()
+
+                                entropy_loss = entropy.mean()
+
+                                loss = pg_loss + cfg.value_coef * v_loss - cfg.entropy_coef * entropy_loss
+
+                            # Scaled backward pass
+                            self.scaler.scale(loss * micro_weight).backward()
 
                             with torch.no_grad():
                                 mb_pg_loss += pg_loss.item() * micro_weight
@@ -144,8 +155,11 @@ class PPOTrainer:
                                     * micro_weight
                                 )
 
+                        # Unscale gradients and clip
+                        self.scaler.unscale_(self.optimizer)
                         nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
-                        self.optimizer.step()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
                         break
                     except oom_errors as exc:
                         if "out of memory" not in str(exc).lower():
