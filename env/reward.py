@@ -1,16 +1,13 @@
 """
 reward.py — Reward shaping for Chess Obscur.
 
-Rewards are designed to guide the agent toward:
-1. Winning (checkmate / king capture / forced check rule)
-2. Material advantage (captures weighted by piece value)
-3. Good defense decisions (successful blocks/parries)
-4. Efficient check resolution
-5. Controlling center, development (light shaping)
-
-CHANGES from v2:
-- REWARD_PARRY_SELF_CAPTURE: negative reward scaled by piece value (was +0.03!)
-- REWARD_PARRY_SKIP: small positive reward for choosing not to move (new action)
+CHANGES v3 (parry fix + tuning):
+- REWARD_PARRY_SELF_CAPTURE: increased penalty -0.08 -> -0.20 (scaled by piece value)
+- REWARD_PARRY_SKIP: increased 0.005 -> 0.025 (make safe choice more attractive)
+- REWARD_PARRY_MOVE_GOOD: increased 0.03 -> 0.08 (incentivize good parry moves)
+- REWARD_PARRY_ENEMY_CAPTURE: NEW +0.05 (bonus for triggering defense on opponent's piece during parry)
+- REWARD_STEP_PENALTY: reduced -0.003 -> -0.002 (less penalty, agent was playing too fast/recklessly)
+- REWARD_CHECK_GIVEN: increased 0.08 -> 0.10 (stronger signal for check)
 """
 import torch
 from env.move_tables import EMPTY
@@ -24,16 +21,17 @@ REWARD_DRAW = -0.3
 # ── Intermediate shaping ──
 REWARD_CAPTURE_SCALE = 0.10          # * piece_value of captured piece (positive for capturer)
 REWARD_LOSE_PIECE_SCALE = -0.10      # * piece_value of own piece lost (negative for loser)
-REWARD_CHECK_GIVEN = 0.08            # giving check
+REWARD_CHECK_GIVEN = 0.10            # CHANGED: 0.08 -> 0.10, giving check is important
 REWARD_BLOCK_SUCCESS = 0.06          # successfully blocked a capture
 REWARD_PARRY_SUCCESS = 0.12          # parry is harder, reward more
 REWARD_DEFENSE_FAIL = -0.01          # tried to defend but failed
 REWARD_ACCEPT_LOSS = -0.02           # accepted loss without trying
-REWARD_PARRY_MOVE_GOOD = 0.03       # made a useful parry move (non-capture, non-self)
-REWARD_PARRY_SELF_CAPTURE = -0.08    # NEW: penalty for eating your own piece during parry (* piece_value)
-REWARD_PARRY_SKIP = 0.005           # NEW: small reward for choosing to skip parry (neutral/safe)
+REWARD_PARRY_MOVE_GOOD = 0.08        # CHANGED: 0.03 -> 0.08, good parry moves are very valuable
+REWARD_PARRY_SELF_CAPTURE = -0.20    # CHANGED: -0.08 -> -0.20, HARSH penalty for eating your own piece (* piece_value)
+REWARD_PARRY_ENEMY_CAPTURE = 0.05    # NEW: bonus for triggering defense on opponent piece during parry
+REWARD_PARRY_SKIP = 0.025            # CHANGED: 0.005 -> 0.025, skipping is a valid safe choice
 REWARD_CHECK_ATTEMPT_PENALTY = -0.05 # each wasted check attempt (3-check rule)
-REWARD_STEP_PENALTY = -0.003         # slightly stronger to push toward finishing
+REWARD_STEP_PENALTY = -0.002         # CHANGED: -0.003 -> -0.002, less aggressive time pressure
 
 
 def compute_material(board: torch.Tensor, piece_values: torch.Tensor, 

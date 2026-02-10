@@ -8,6 +8,7 @@ CHANGES from v1 (BUGFIX markers throughout):
   4. BUGFIX #4: Added half-move clock reset on pawn moves and captures
   5. BUGFIX #5: 50-move draw rule based on half_moves (100 half-moves = 50 full moves)
   6. IMPROVEMENT: step() returns richer info dict for diagnostics
+  7. NEW: Parry outcome counters for TensorBoard tracking
 """
 import torch
 from typing import Tuple, Optional, Dict
@@ -62,6 +63,14 @@ class ChessObscurEnv:
         self.parry_square = torch.full((num_envs,), -1, dtype=torch.int16, device=dev)
         self.parry_controller_is_white = torch.zeros(num_envs, dtype=torch.bool, device=dev)
         self.agent_is_white = torch.ones(num_envs, dtype=torch.bool, device=dev)
+
+        # ── Parry outcome counters (for TensorBoard tracking) ──
+        self.parry_self_capture_count = 0
+        self.parry_good_move_count = 0
+        self.parry_skip_count = 0
+        self.parry_enemy_capture_count = 0
+        self.parry_total_count = 0
+
         self.reset()
 
     # ══════════════════════════════════════════════
@@ -139,6 +148,22 @@ class ChessObscurEnv:
     def set_max_steps(self, new_max_steps: int):
         """Update the maximum game length for timeout draws."""
         self.max_steps = new_max_steps
+
+    def get_and_reset_parry_stats(self) -> dict:
+        """Return parry outcome counts since last call, then reset."""
+        stats = {
+            "parry/total": self.parry_total_count,
+            "parry/self_capture": self.parry_self_capture_count,
+            "parry/good_move": self.parry_good_move_count,
+            "parry/skip": self.parry_skip_count,
+            "parry/enemy_capture": self.parry_enemy_capture_count,
+        }
+        self.parry_total_count = 0
+        self.parry_self_capture_count = 0
+        self.parry_good_move_count = 0
+        self.parry_skip_count = 0
+        self.parry_enemy_capture_count = 0
+        return stats
 
     # ══════════════════════════════════════════════
     #  OBSERVATION (already batched)
@@ -600,6 +625,8 @@ class ChessObscurEnv:
                 # ── FIX: check if this is a "parry skip" (from==to, encoded as same square) ──
                 if fs == ts:
                     # Skip parry — don't move the piece
+                    self.parry_skip_count += 1
+                    self.parry_total_count += 1
                     self.phase[i]=PHASE_MOVE; self.parry_square[i]=-1
                     reward[i]+=REWARD_PARRY_SKIP
                     self._enforce_check(i,cw,reward); continue
@@ -608,6 +635,8 @@ class ChessObscurEnv:
                     tw=1<=tgt<=6
                     if cw==tw:
                         # Self-capture: controller eats their own piece
+                        self.parry_self_capture_count += 1
+                        self.parry_total_count += 1
                         # ── FIX: NEGATIVE reward scaled by piece value instead of positive ──
                         dt = (tgt-1) if tgt<=6 else (tgt-7)
                         piece_val = self.tables.piece_values[dt].item()
@@ -618,8 +647,18 @@ class ChessObscurEnv:
                         self.half_moves[i]=0
                         self._enforce_check(i,cw,reward); continue
                     else:
+                        # Parry capture of opponent piece -> triggers defense (good for controller)
+                        self.parry_enemy_capture_count += 1
+                        self.parry_total_count += 1
+                        from env.reward import REWARD_PARRY_ENEMY_CAPTURE
+                        agent_is_controller = (cw == self.agent_is_white[i].item())
+                        if agent_is_controller:
+                            reward[i] += REWARD_PARRY_ENEMY_CAPTURE
                         self._start_defense(i,fs,ts,mv,tgt,cw); continue
+
                 else:
+                    self.parry_good_move_count += 1
+                    self.parry_total_count += 1
                     bd[ts]=bd[fs]; bd[fs]=EMPTY; self._post_move_updates(i,fs,ts)
                     self.phase[i]=PHASE_MOVE; self.parry_square[i]=-1
                     reward[i]+=REWARD_PARRY_MOVE_GOOD

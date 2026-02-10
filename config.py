@@ -1,5 +1,15 @@
 """
 config.py — All hyperparameters for Chess Obscur PPO training.
+
+CHANGES v3 (parry fix + stability):
+- entropy_coef_min: 0.0005 -> 0.0015 (keep exploring, especially parry situations)
+- entropy_coef: 0.003 -> 0.005 (restart with more exploration if retraining)
+- entropy_coef_decay_steps: 100M -> 200M (slower decay)
+- clip_eps: 0.2 -> 0.15 (reduce policy instability, clipfrac was 0.25)
+- value_head_hidden: 256 -> 384 (value loss was still 0.46, needs more capacity)
+- ppo_epochs: 4 -> 3 (with smaller clip_eps, fewer epochs prevent overshooting)
+- num_minibatches: 4 -> 8 (smaller minibatches = more stable gradients)
+- REWARD_STEP_PENALTY via reward.py: -0.003 -> -0.002
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -22,9 +32,9 @@ class Config:
     # ── Curriculum: progressive max_steps increase ──
     curriculum_enabled: bool = True
     curriculum_start_steps: int = 120      # starting max_steps
-    curriculum_step_increase: int = 15     # CHANGED: 30 → 15, transition plus douce
+    curriculum_step_increase: int = 15     # transition douce
     curriculum_every_n_timesteps: int = 5_000_000  # every 5M timesteps
-    curriculum_max_steps_cap: int = 300    # NEW: ne jamais dépasser 300 steps
+    curriculum_max_steps_cap: int = 300    # ne jamais dépasser 300 steps
 
     # ── Observation ──
     obs_planes: int = 19
@@ -45,22 +55,22 @@ class Config:
     # ── Network ──
     num_res_blocks: int = 10
     num_filters: int = 128
-    value_head_hidden: int = 256
+    value_head_hidden: int = 384     # CHANGED: 256 -> 384, value loss was high
     policy_head_filters: int = 32
 
     # ── PPO ──
     lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_eps: float = 0.2
+    clip_eps: float = 0.15           # CHANGED: 0.2 -> 0.15, reduce policy instability
     clip_value: float = 0.5
-    entropy_coef: float = 0.003           # valeur initiale
-    entropy_coef_min: float = 0.0005      # NEW: plancher du decay
-    entropy_coef_decay_steps: int = 100_000_000  # NEW: atteint le min à ce step
+    entropy_coef: float = 0.005      # CHANGED: 0.003 -> 0.005, more initial exploration
+    entropy_coef_min: float = 0.0015  # CHANGED: 0.0005 -> 0.0015, keep exploring parry
+    entropy_coef_decay_steps: int = 200_000_000  # CHANGED: 100M -> 200M, slower decay
     value_coef: float = 1.0
     max_grad_norm: float = 0.5
-    ppo_epochs: int = 4
-    num_minibatches: int = 4         # reduced from 8 for larger minibatches
+    ppo_epochs: int = 3              # CHANGED: 4 -> 3, prevent overshooting with tighter clip
+    num_minibatches: int = 8         # CHANGED: 4 -> 8, more stable gradients
 
     # ── Rollout ──
     rollout_steps: int = 256         # steps per env before PPO update

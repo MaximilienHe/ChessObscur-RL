@@ -4,6 +4,10 @@ self_play.py — Self-play rollout collection.
 CHANGES from v2:
 - Track per-color rewards (white_reward, black_reward) for TensorBoard
 - Agent win rate tracked properly
+
+CHANGES from v3:
+- Read parry outcome stats from env (self_capture, good_move, skip, enemy_capture)
+  and compute rates for TensorBoard
 """
 import torch
 import time
@@ -83,6 +87,7 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
     move_phases_seen = 0
     total_legal_actions = 0
     game_lengths = []
+    
 
     network.eval()
     with torch.no_grad():
@@ -163,5 +168,17 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
         stats["game/avg_length"] = sum(game_lengths) / len(game_lengths)
         stats["game/max_length"] = max(game_lengths)
         stats["game/min_length"] = min(game_lengths)
+
+    # ── Parry outcome stats from environment ──
+    parry_stats = env.get_and_reset_parry_stats()
+    stats.update(parry_stats)
+
+    # Compute rates for TensorBoard (avoid div by zero)
+    pt = parry_stats["parry/total"]
+    if pt > 0:
+        stats["parry/self_capture_rate"] = parry_stats["parry/self_capture"] / pt
+        stats["parry/good_move_rate"] = parry_stats["parry/good_move"] / pt
+        stats["parry/skip_rate"] = parry_stats["parry/skip"] / pt
+        stats["parry/enemy_capture_rate"] = parry_stats["parry/enemy_capture"] / pt
 
     return obs, stats

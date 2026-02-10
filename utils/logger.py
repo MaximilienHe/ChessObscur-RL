@@ -5,6 +5,9 @@ CHANGES from v1:
 - Log all game/* metrics in console output
 - Log rollout diagnostic metrics
 - Better formatting
+
+CHANGES from v2:
+- Log parry outcome rates in console output
 """
 import os
 import time
@@ -60,6 +63,12 @@ class Logger:
         avg_reward = metrics.get("rollout/mean_reward", None)
         if avg_reward is not None:
             parts.append(f"mean_rew={avg_reward:.4f}")
+
+        # NEW: parry outcome rates
+        for key in ["parry/self_capture_rate", "parry/good_move_rate",
+                     "parry/skip_rate", "parry/enemy_capture_rate"]:
+            if key in metrics:
+                parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
 
         print(" | ".join(parts))
 
