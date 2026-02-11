@@ -19,17 +19,17 @@ REWARD_LOSE = -1.0
 REWARD_DRAW = -0.3
 
 # ── Intermediate shaping ──
-REWARD_CAPTURE_SCALE = 0.10          # * piece_value of captured piece (positive for capturer)
-REWARD_LOSE_PIECE_SCALE = -0.10      # * piece_value of own piece lost (negative for loser)
-REWARD_CHECK_GIVEN = 0.10            # CHANGED: 0.08 -> 0.10, giving check is important
+REWARD_CAPTURE_SCALE = 0.14          # Aggressive preset: prioritize material gains
+REWARD_LOSE_PIECE_SCALE = -0.08      # Slightly softer loss penalty to reduce over-caution
+REWARD_CHECK_GIVEN = 0.06            # Reduce check-farming vs concrete captures
 REWARD_BLOCK_SUCCESS = 0.06          # successfully blocked a capture
 REWARD_PARRY_SUCCESS = 0.12          # parry is harder, reward more
 REWARD_DEFENSE_FAIL = -0.01          # tried to defend but failed
 REWARD_ACCEPT_LOSS = -0.02           # accepted loss without trying
-REWARD_PARRY_MOVE_GOOD = 0.08        # CHANGED: 0.03 -> 0.08, good parry moves are very valuable
+REWARD_PARRY_MOVE_GOOD = 0.05        # Keep good parry positive but less dominant
 REWARD_PARRY_SELF_CAPTURE = -0.20    # CHANGED: -0.08 -> -0.20, HARSH penalty for eating your own piece (* piece_value)
-REWARD_PARRY_ENEMY_CAPTURE = 0.05    # NEW: bonus for triggering defense on opponent piece during parry
-REWARD_PARRY_SKIP = 0.025            # CHANGED: 0.005 -> 0.025, skipping is a valid safe choice
+REWARD_PARRY_ENEMY_CAPTURE = 0.12    # Strongly encourage offensive parry follow-ups
+REWARD_PARRY_SKIP = 0.00             # Neutral skip: do not reward passive parry behavior
 REWARD_CHECK_ATTEMPT_PENALTY = -0.05 # each wasted check attempt (3-check rule)
 REWARD_STEP_PENALTY = -0.002         # CHANGED: -0.003 -> -0.002, less aggressive time pressure
 

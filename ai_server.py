@@ -83,6 +83,94 @@ PIECE_TO_INT = {
     "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
 }
 
+
+def _in_bounds(file_idx: int, rank_idx: int) -> bool:
+    return 0 <= file_idx < 8 and 0 <= rank_idx < 8
+
+
+def _board_piece(board: torch.Tensor, file_idx: int, rank_idx: int) -> int:
+    if not _in_bounds(file_idx, rank_idx):
+        return 0
+    return int(board[file_idx + rank_idx * 8].item())
+
+
+def _find_king(board: torch.Tensor, king_is_white: bool) -> Optional[int]:
+    target = 6 if king_is_white else 12
+    for idx in range(64):
+        if int(board[idx].item()) == target:
+            return idx
+    return None
+
+
+def _is_square_attacked(board: torch.Tensor, sq_idx: int, by_white: bool) -> bool:
+    file_idx = sq_idx % 8
+    rank_idx = sq_idx // 8
+
+    # Pawn attacks (reverse lookup from target square).
+    pawn_piece = 1 if by_white else 7
+    pawn_rank = rank_idx - 1 if by_white else rank_idx + 1
+    for df in (-1, 1):
+        pf = file_idx + df
+        if _in_bounds(pf, pawn_rank) and _board_piece(board, pf, pawn_rank) == pawn_piece:
+            return True
+
+    # Knight attacks.
+    knight_piece = 2 if by_white else 8
+    knight_offsets = ((1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2))
+    for df, dr in knight_offsets:
+        nf, nr = file_idx + df, rank_idx + dr
+        if _in_bounds(nf, nr) and _board_piece(board, nf, nr) == knight_piece:
+            return True
+
+    # King attacks.
+    king_piece = 6 if by_white else 12
+    for df in (-1, 0, 1):
+        for dr in (-1, 0, 1):
+            if df == 0 and dr == 0:
+                continue
+            kf, kr = file_idx + df, rank_idx + dr
+            if _in_bounds(kf, kr) and _board_piece(board, kf, kr) == king_piece:
+                return True
+
+    # Sliding attacks.
+    bishop_piece = 3 if by_white else 9
+    rook_piece = 4 if by_white else 10
+    queen_piece = 5 if by_white else 11
+
+    def _ray(df: int, dr: int, bishop_ok: bool, rook_ok: bool) -> bool:
+        rf, rr = file_idx + df, rank_idx + dr
+        while _in_bounds(rf, rr):
+            piece = _board_piece(board, rf, rr)
+            if piece != 0:
+                if piece == queen_piece:
+                    return True
+                if bishop_ok and piece == bishop_piece:
+                    return True
+                if rook_ok and piece == rook_piece:
+                    return True
+                return False
+            rf += df
+            rr += dr
+        return False
+
+    # Diagonals
+    if _ray(1, 1, True, False) or _ray(1, -1, True, False) or _ray(-1, 1, True, False) or _ray(-1, -1, True, False):
+        return True
+    # Straights
+    if _ray(1, 0, False, True) or _ray(-1, 0, False, True) or _ray(0, 1, False, True) or _ray(0, -1, False, True):
+        return True
+
+    return False
+
+
+def _is_in_check(board: torch.Tensor, side_is_white: bool) -> bool:
+    king_sq = _find_king(board, side_is_white)
+    if king_sq is None:
+        # Mirror training env semantics: missing king = in check / losing state.
+        return True
+    return _is_square_attacked(board, king_sq, by_white=not side_is_white)
+
+
 def board_js_to_tensor(board_js: list) -> torch.Tensor:
     """Convertit le board JS (64 éléments, null ou string) en tensor int8."""
     t = torch.zeros(64, dtype=torch.int8)
@@ -132,6 +220,9 @@ def build_obs_from_request(req: MoveRequest) -> torch.Tensor:
 
     # Turn
     obs[14] = 1.0 if is_white else 0.0
+
+    # In-check plane (side to move).
+    obs[15] = 1.0 if _is_in_check(board, is_white) else 0.0
 
     # Phase
     phase_map = {"move": 0, "defense": 1, "parry_move": 2}
@@ -235,19 +326,53 @@ device: torch.device = None
 temperature: float = 0.5
 
 
-def load_model(checkpoint_path: str, dev: str = "cpu"):
+def _strip_compile_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Remove _orig_mod. prefix added by torch.compile checkpoints."""
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("_orig_mod."):
+            new_state_dict[key.replace("_orig_mod.", "", 1)] = value
+        else:
+            new_state_dict[key] = value
+    return new_state_dict
+
+
+def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor], cfg: Config) -> None:
+    """
+    Infer model architecture from checkpoint weights.
+    This keeps ai_server compatible with older checkpoints.
+    """
+    if "input_conv.0.weight" in state_dict:
+        w = state_dict["input_conv.0.weight"]
+        cfg.num_filters = int(w.shape[0])
+        cfg.obs_planes = int(w.shape[1])
+
+    if "policy_conv.0.weight" in state_dict:
+        cfg.policy_head_filters = int(state_dict["policy_conv.0.weight"].shape[0])
+
+    if "policy_fc.weight" in state_dict:
+        cfg.total_actions = int(state_dict["policy_fc.weight"].shape[0])
+
+    if "value_fc.0.weight" in state_dict:
+        cfg.value_head_hidden = int(state_dict["value_fc.0.weight"].shape[0])
+
+    res_block_indices = []
+    for key in state_dict.keys():
+        if key.startswith("res_blocks."):
+            parts = key.split(".")
+            if len(parts) > 1 and parts[1].isdigit():
+                res_block_indices.append(int(parts[1]))
+    if res_block_indices:
+        cfg.num_res_blocks = max(res_block_indices) + 1
+
+
+def load_model(checkpoint_path: str, dev: str = "cpu",
+               value_head_hidden: Optional[int] = None,
+               num_res_blocks: Optional[int] = None,
+               num_filters: Optional[int] = None,
+               policy_head_filters: Optional[int] = None):
     global model, device
     device = torch.device(dev)
-    cfg = Config()
-    model = ChessObscurNetwork(
-        obs_planes=cfg.obs_planes,
-        num_filters=cfg.num_filters,
-        num_res_blocks=cfg.num_res_blocks,
-        policy_head_filters=cfg.policy_head_filters,
-        value_head_hidden=cfg.value_head_hidden,
-        total_actions=cfg.total_actions,
-    ).to(device)
-
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Extract state dict
@@ -257,17 +382,37 @@ def load_model(checkpoint_path: str, dev: str = "cpu"):
         state_dict = ckpt
 
     # Remove _orig_mod. prefix if present (from torch.compile)
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith("_orig_mod."):
-            new_key = key.replace("_orig_mod.", "")
-            new_state_dict[new_key] = value
-        else:
-            new_state_dict[key] = value
+    new_state_dict = _strip_compile_prefix(state_dict)
+
+    cfg = Config()
+    _infer_arch_from_state_dict(new_state_dict, cfg)
+
+    # Optional explicit overrides for older/newer checkpoints.
+    if value_head_hidden is not None:
+        cfg.value_head_hidden = value_head_hidden
+    if num_res_blocks is not None:
+        cfg.num_res_blocks = num_res_blocks
+    if num_filters is not None:
+        cfg.num_filters = num_filters
+    if policy_head_filters is not None:
+        cfg.policy_head_filters = policy_head_filters
+
+    model = ChessObscurNetwork(
+        obs_planes=cfg.obs_planes,
+        num_filters=cfg.num_filters,
+        num_res_blocks=cfg.num_res_blocks,
+        policy_head_filters=cfg.policy_head_filters,
+        value_head_hidden=cfg.value_head_hidden,
+        total_actions=cfg.total_actions,
+    ).to(device)
 
     model.load_state_dict(new_state_dict)
     model.eval()
     print(f"[ai] Modèle chargé: {checkpoint_path} sur {device}")
+    print(
+        f"[ai] Arch: num_filters={cfg.num_filters}, num_res_blocks={cfg.num_res_blocks}, "
+        f"policy_head_filters={cfg.policy_head_filters}, value_head_hidden={cfg.value_head_hidden}"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -288,14 +433,17 @@ def get_move(req: MoveRequest):
     with torch.no_grad():
         policy_logits, value = model(obs, legal_mask)
 
-        # Appliquer température
-        if temperature > 0:
+        # True greedy mode for temperature <= 0
+        if temperature <= 0:
+            greedy_logits = policy_logits.masked_fill(~legal_mask, -1e8)
+            action = torch.argmax(greedy_logits, dim=-1).item()
+        else:
+            # Appliquer température
             policy_logits = policy_logits / temperature
-
-        # Masquer les actions illégales
-        policy_logits = policy_logits.masked_fill(~legal_mask, -1e8)
-        probs = F.softmax(policy_logits, dim=-1)
-        action = torch.multinomial(probs, 1).item()
+            # Masquer les actions illégales
+            policy_logits = policy_logits.masked_fill(~legal_mask, -1e8)
+            probs = F.softmax(policy_logits, dim=-1)
+            action = torch.multinomial(probs, 1).item()
 
     # Décoder l'action
     if req.phase == "defense":
@@ -368,8 +516,23 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu", help="cpu ou cuda")
     parser.add_argument("--temperature", type=float, default=0.5,
                         help="Température de sampling (0=greedy)")
+    parser.add_argument("--value-head-hidden", type=int, default=None,
+                        help="Override de l'architecture checkpoint si besoin")
+    parser.add_argument("--num-res-blocks", type=int, default=None,
+                        help="Override de l'architecture checkpoint si besoin")
+    parser.add_argument("--num-filters", type=int, default=None,
+                        help="Override de l'architecture checkpoint si besoin")
+    parser.add_argument("--policy-head-filters", type=int, default=None,
+                        help="Override de l'architecture checkpoint si besoin")
     args = parser.parse_args()
 
     temperature = args.temperature
-    load_model(args.checkpoint, args.device)
+    load_model(
+        args.checkpoint,
+        args.device,
+        value_head_hidden=args.value_head_hidden,
+        num_res_blocks=args.num_res_blocks,
+        num_filters=args.num_filters,
+        policy_head_filters=args.policy_head_filters,
+    )
     uvicorn.run(app, host="0.0.0.0", port=args.port)

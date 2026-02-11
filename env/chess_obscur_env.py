@@ -2,8 +2,8 @@
 chess_obscur_env.py — Fully vectorized GPU Chess Obscur environment.
 
 CHANGES from v1 (BUGFIX markers throughout):
-  1. BUGFIX #1: _enforce_check now checks the OPPONENT for check, not the actor
-  2. BUGFIX #2: _enforce_check gives reward for successfully giving check  
+  1. BUGFIX #1: _enforce_check now follows server semantics (checks the ACTOR after action)
+  2. BUGFIX #2: _enforce_check applies the 3-check retry rule to the actor (force replay/cancel parry)
   3. BUGFIX #3: _resolve_defense reward signs were relative to attacker, now relative to agent
   4. BUGFIX #4: Added half-move clock reset on pawn moves and captures
   5. BUGFIX #5: 50-move draw rule based on half_moves (100 half-moves = 50 full moves)
@@ -21,7 +21,7 @@ from env.move_tables import (
 from env.reward import (
     reward_terminal,
     REWARD_CAPTURE_SCALE, REWARD_LOSE_PIECE_SCALE,
-    REWARD_CHECK_GIVEN, REWARD_BLOCK_SUCCESS, REWARD_PARRY_SUCCESS,
+    REWARD_BLOCK_SUCCESS, REWARD_PARRY_SUCCESS,
     REWARD_DEFENSE_FAIL, REWARD_ACCEPT_LOSS, REWARD_PARRY_MOVE_GOOD,
     REWARD_PARRY_SKIP, REWARD_PARRY_SELF_CAPTURE,
     REWARD_STEP_PENALTY, REWARD_CHECK_ATTEMPT_PENALTY,
@@ -705,58 +705,46 @@ class ChessObscurEnv:
             bd[ts]=W_QUEEN if iw else B_QUEEN
 
     # ══════════════════════════════════════════════
-    #  BUGFIX #1 + #2: _enforce_check completely rewritten
+    #  BUGFIX #1 + #2: _enforce_check aligned with server semantics
     # ══════════════════════════════════════════════
 
     def _enforce_check(self, i, actor_w, reward):
         """
-        After actor_w has made a move, check if the OPPONENT (not actor_w) 
-        is now in check. If so, apply the 3-check rule to the OPPONENT.
-        
-        OLD (BUGGY): checked if actor_w was in check (wrong side!)
-        NEW (FIXED): checks if ~actor_w is in check (the opponent)
-        
-        Also: gives REWARD_CHECK_GIVEN when agent delivers check.
+        Server-compatible behavior:
+        - After actor_w performs an action, verify whether actor_w is still in check.
+        - If yes: increment actor_w check attempts, force actor_w to replay in PHASE_MOVE,
+          and cancel pending states (notably parry).
+        - On 3 consecutive failed attempts, actor_w loses.
         """
-        opponent_w = not actor_w
-        
-        # Is the opponent's king in check?
-        opponent_in_check = self._is_in_check_batched(
+        actor_in_check = self._is_in_check_batched(
             self.board[i:i+1],
-            torch.tensor([opponent_w], dtype=torch.bool, device=self.device)
+            torch.tensor([actor_w], dtype=torch.bool, device=self.device)
         )[0].item()
-        
-        # The 3-check rule: the OPPONENT gets a check attempt counted against them
-        # (they are the one who failed to avoid being in check)
-        opponent_ci = 0 if opponent_w else 1  # index into check_attempts for opponent
-        
-        if opponent_in_check:
-            self.check_attempts[i, opponent_ci] += 1
-            
-            # BUGFIX #2: Reward for giving check
+
+        actor_ci = 0 if actor_w else 1
+
+        if actor_in_check:
+            self.check_attempts[i, actor_ci] += 1
+
+            # Penalize failed escapes from check for the acting side.
             agent_is_actor = (actor_w == self.agent_is_white[i].item())
             if agent_is_actor:
-                reward[i] += REWARD_CHECK_GIVEN
-            else:
-                reward[i] -= REWARD_CHECK_GIVEN * 0.5  # opponent gave agent check
-            
-            # Opponent must escape check: give the turn to the opponent
-            self.turn_is_white[i] = opponent_w
+                reward[i] += REWARD_CHECK_ATTEMPT_PENALTY
+
+            # Actor must replay from move phase; cancel any pending capture/parry state.
+            self.turn_is_white[i] = actor_w
             self.phase[i] = PHASE_MOVE
             self.pending_attacker_sq[i] = -1
-            
-            # 3-check rule: if opponent has been checked 3 times, they lose
-            if self.check_attempts[i, opponent_ci] >= 3:
+            self.pending_target_sq[i] = -1
+            self.parry_square[i] = -1
+
+            # 3-check rule: actor loses on the 3rd consecutive failed attempt.
+            if self.check_attempts[i, actor_ci] >= 3:
                 self.phase[i] = PHASE_FINISHED
-                # Opponent loses
-                self.result[i] = RESULT_BLACK_WIN if opponent_w else RESULT_WHITE_WIN
-                
-                # Penalty for the side that got 3-checked
-                if not agent_is_actor:
-                    reward[i] += REWARD_CHECK_ATTEMPT_PENALTY
+                self.result[i] = RESULT_BLACK_WIN if actor_w else RESULT_WHITE_WIN
         else:
-            # No check — reset opponent's consecutive check counter
-            self.check_attempts[i, opponent_ci] = 0
+            # Check escaped: reset actor consecutive check counter.
+            self.check_attempts[i, actor_ci] = 0
 
     def _check_endgame(self, reward):
         active = (self.phase==PHASE_MOVE)
