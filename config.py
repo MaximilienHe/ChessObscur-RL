@@ -55,7 +55,7 @@ class Config:
     # ── Network ──
     num_res_blocks: int = 10
     num_filters: int = 128
-    value_head_hidden: int = 384     # CHANGED: 256 -> 384, value loss was high
+    value_head_hidden: int = 256     # CHANGED: 256 -> 384, value loss was high
     policy_head_filters: int = 32
 
     # ── PPO ──
