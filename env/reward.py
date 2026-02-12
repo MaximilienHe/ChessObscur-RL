@@ -1,13 +1,20 @@
 """
 reward.py — Reward shaping for Chess Obscur.
 
-CHANGES v3 (parry fix + tuning):
-- REWARD_PARRY_SELF_CAPTURE: increased penalty -0.08 -> -0.20 (scaled by piece value)
-- REWARD_PARRY_SKIP: increased 0.005 -> 0.025 (make safe choice more attractive)
-- REWARD_PARRY_MOVE_GOOD: increased 0.03 -> 0.08 (incentivize good parry moves)
-- REWARD_PARRY_ENEMY_CAPTURE: NEW +0.05 (bonus for triggering defense on opponent's piece during parry)
-- REWARD_STEP_PENALTY: reduced -0.003 -> -0.002 (less penalty, agent was playing too fast/recklessly)
-- REWARD_CHECK_GIVEN: increased 0.08 -> 0.10 (stronger signal for check)
+CHANGES v4 (aggression + parry activation + draw reduction + smart check):
+- REWARD_CAPTURE_SCALE: 0.14 -> 0.20 (agent is not aggressive enough, needs more capture incentive)
+- REWARD_LOSE_PIECE_SCALE: -0.08 -> -0.06 (agent was too cautious, slightly softer loss penalty)
+- REWARD_PARRY_MOVE_GOOD: 0.05 -> 0.15 (KEY: parry good_move was 17% dropping to 9%, need strong incentive)
+- REWARD_PARRY_SKIP: 0.00 -> -0.03 (KEY: skip was 91%! must penalize skipping parry)
+- REWARD_PARRY_ENEMY_CAPTURE: 0.12 -> 0.25 (was 0.0% usage — huge bonus for using parry aggressively)
+- REWARD_PARRY_SELF_CAPTURE: -0.20 -> -0.30 (keep harsh for self-capture, scaled by piece value)
+- REWARD_PARRY_SUCCESS: 0.12 -> 0.18 (increase reward for choosing parry in defense, it enables good parry moves)
+- REWARD_BLOCK_SUCCESS: 0.06 -> 0.05 (slightly nerf block relative to parry)
+- REWARD_DRAW: -0.3 -> -0.5 (KEY: draw rate was 75%!! stronger draw penalty)
+- REWARD_STEP_PENALTY: -0.002 -> -0.003 (slightly more time pressure, games averaged 364 half-moves)
+- NEW: REWARD_CAPTURE_HIGH_ATTACKER: bonus for using high-attack pieces for captures
+- NEW: REWARD_CHECK_ESCAPE_SAFE: bonus for escaping check by moving (not just capturing)
+- NEW: REWARD_CHECK_ESCAPE_GREEDY_3RD: penalty for attempting capture on 3rd check (should play safe)
 """
 import torch
 from env.move_tables import EMPTY
@@ -16,22 +23,29 @@ from env.move_tables import EMPTY
 # ── Terminal rewards ──
 REWARD_WIN = 1.0
 REWARD_LOSE = -1.0
-REWARD_DRAW = -0.3
+REWARD_DRAW = -0.5              # CHANGED: -0.3 -> -0.5, draw rate was 75%!
 
 # ── Intermediate shaping ──
-REWARD_CAPTURE_SCALE = 0.14          # Aggressive preset: prioritize material gains
-REWARD_LOSE_PIECE_SCALE = -0.08      # Slightly softer loss penalty to reduce over-caution
-REWARD_CHECK_GIVEN = 0.06            # Reduce check-farming vs concrete captures
-REWARD_BLOCK_SUCCESS = 0.06          # successfully blocked a capture
-REWARD_PARRY_SUCCESS = 0.12          # parry is harder, reward more
+REWARD_CAPTURE_SCALE = 0.20          # CHANGED: 0.14 -> 0.20, boost aggression
+REWARD_LOSE_PIECE_SCALE = -0.06      # CHANGED: -0.08 -> -0.06, less cautious
+REWARD_CHECK_GIVEN = 0.06            # keep same
+REWARD_BLOCK_SUCCESS = 0.05          # CHANGED: 0.06 -> 0.05, slight nerf vs parry
+REWARD_PARRY_SUCCESS = 0.18          # CHANGED: 0.12 -> 0.18, encourage choosing parry in defense
 REWARD_DEFENSE_FAIL = -0.01          # tried to defend but failed
-REWARD_ACCEPT_LOSS = -0.02           # accepted loss without trying
-REWARD_PARRY_MOVE_GOOD = 0.05        # Keep good parry positive but less dominant
-REWARD_PARRY_SELF_CAPTURE = -0.20    # CHANGED: -0.08 -> -0.20, HARSH penalty for eating your own piece (* piece_value)
-REWARD_PARRY_ENEMY_CAPTURE = 0.12    # Strongly encourage offensive parry follow-ups
-REWARD_PARRY_SKIP = 0.00             # Neutral skip: do not reward passive parry behavior
-REWARD_CHECK_ATTEMPT_PENALTY = -0.05 # each wasted check attempt (3-check rule)
-REWARD_STEP_PENALTY = -0.002         # CHANGED: -0.003 -> -0.002, less aggressive time pressure
+REWARD_ACCEPT_LOSS = -0.04           # CHANGED: -0.02 -> -0.04, penalize passive acceptance more
+REWARD_PARRY_MOVE_GOOD = 0.15        # CHANGED: 0.05 -> 0.15, KEY: good_move rate was dropping to 9%
+REWARD_PARRY_SELF_CAPTURE = -0.30    # CHANGED: -0.20 -> -0.30, harsh penalty (* piece_value)
+REWARD_PARRY_ENEMY_CAPTURE = 0.25    # CHANGED: 0.12 -> 0.25, enemy_capture rate was 0.0%!
+REWARD_PARRY_SKIP = -0.03            # CHANGED: 0.00 -> -0.03, skip rate was 91%, must penalize
+REWARD_CHECK_ATTEMPT_PENALTY = -0.05 # keep same
+REWARD_STEP_PENALTY = -0.003         # CHANGED: -0.002 -> -0.003, avg game length was 364
+
+# ── NEW: capture quality bonus (use high-attack piece) ──
+REWARD_CAPTURE_ATTACKER_BONUS = 0.02  # per point of attacker attack_stat above defender
+
+# ── NEW: check escape shaping ──
+REWARD_CHECK_ESCAPE_MOVE = 0.03      # bonus for escaping check by moving (not capture)
+REWARD_CHECK_3RD_CAPTURE_PENALTY = -0.08  # penalty for trying capture on 3rd check attempt
 
 
 def compute_material(board: torch.Tensor, piece_values: torch.Tensor, 
@@ -92,7 +106,7 @@ def reward_terminal(result_code: torch.Tensor, active_is_white: torch.Tensor,
     reward = torch.where(white_wins & ~active_is_white,
                          torch.tensor(REWARD_LOSE, device=reward.device), reward)
 
-    # Draws
+    # Draws — stronger penalty, especially for timeout draws
     if draws.any():
         timeout_draws = draws.clone()
         if full_move_count is not None:
@@ -105,8 +119,9 @@ def reward_terminal(result_code: torch.Tensor, active_is_white: torch.Tensor,
 
         if timeout_draws.any() and board is not None and piece_values is not None:
             material_advantage = compute_material(board, piece_values, active_is_white)
-            base_draw_reward = -0.3
-            material_scale = 0.2
+            # Timeout draws are WORSE than regular draws — agent should have won
+            base_draw_reward = -0.6  # CHANGED: -0.3 -> -0.6 for timeout
+            material_scale = 0.25    # CHANGED: 0.2 -> 0.25
             normalized_advantage = torch.tanh(material_advantage / 10.0)
             timeout_reward = base_draw_reward + material_scale * normalized_advantage
             reward = torch.where(timeout_draws, timeout_reward, reward)

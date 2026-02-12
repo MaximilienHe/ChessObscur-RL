@@ -1,13 +1,10 @@
 """
 logger.py — TensorBoard + console logging.
 
-CHANGES from v1:
-- Log all game/* metrics in console output
-- Log rollout diagnostic metrics
-- Better formatting
-
-CHANGES from v2:
-- Log parry outcome rates in console output
+CHANGES v4:
+- Log parry diagnostic rates (could_move, skip_when_could_*)
+- Log capture quality (high_attacker rate)
+- Log check escape behavior (3rd attempt move rate)
 """
 import os
 import time
@@ -49,13 +46,12 @@ class Logger:
             if key in metrics:
                 parts.append(f"{key.split('/')[-1]}={metrics[key]:.4f}")
 
-        # CHANGED: log ALL game metrics
+        # Game metrics
         for key in ["game/win_rate", "game/draw_rate", "game/avg_length",
                      "game/white_win_rate", "game/black_win_rate"]:
             if key in metrics:
                 parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
 
-        # NEW: rollout diagnostics
         gc = metrics.get("rollout/games_completed", 0)
         if gc > 0:
             parts.append(f"games_in_rollout={int(gc)}")
@@ -64,11 +60,25 @@ class Logger:
         if avg_reward is not None:
             parts.append(f"mean_rew={avg_reward:.4f}")
 
-        # NEW: parry outcome rates
+        # Parry stats (basic)
         for key in ["parry/self_capture_rate", "parry/good_move_rate",
                      "parry/skip_rate", "parry/enemy_capture_rate"]:
             if key in metrics:
                 parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
+
+        # NEW v4: Parry diagnostics
+        for key in ["parry/could_move_rate", "parry/skip_when_could_move_rate",
+                     "parry/skip_when_could_capture_rate"]:
+            if key in metrics:
+                parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
+
+        # NEW v4: Capture quality
+        if "capture/high_attacker_rate" in metrics:
+            parts.append(f"high_atk_rate={metrics['capture/high_attacker_rate']:.3f}")
+
+        # NEW v4: Check escape
+        if "check/3rd_attempt_move_rate" in metrics:
+            parts.append(f"3rd_chk_move={metrics['check/3rd_attempt_move_rate']:.3f}")
 
         print(" | ".join(parts))
 

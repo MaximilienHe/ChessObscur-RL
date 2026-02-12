@@ -14,6 +14,8 @@ python evaluate_model.py --checkpoint checkpoints/step_215744512.pt \
 
 # After training with new rewards, compare
 python evaluate_model.py \
-    --checkpoint-a checkpoints/step_158072832.pt \
-    --checkpoint-b checkpoints/step_NEW.pt \
+    --checkpoint-a checkpoints/step_215744512.pt \
+    --checkpoint-b checkpoints/step_231473152.pt \
     --device cuda --num-games 500 --value-head-hidden 256
+
+python -m training.train --resume latest --device cuda --num-envs 3584 --microbatch-size 12288

@@ -1,13 +1,11 @@
 """
 self_play.py — Self-play rollout collection.
 
-CHANGES from v2:
-- Track per-color rewards (white_reward, black_reward) for TensorBoard
-- Agent win rate tracked properly
-
-CHANGES from v3:
-- Read parry outcome stats from env (self_capture, good_move, skip, enemy_capture)
-  and compute rates for TensorBoard
+CHANGES v4:
+- Collect richer parry diagnostics (could_move, could_capture, skip_when_could_*)
+- Collect capture quality stats (high_attacker usage)
+- Collect check escape stats (escape by move vs capture, 3rd attempt behavior)
+- Compute rates for all new metrics
 """
 import torch
 import time
@@ -75,37 +73,31 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
     black_wins = 0
     draws = 0
 
-    # NEW: track per-color cumulative rewards
     white_reward_sum = 0.0
     black_reward_sum = 0.0
     white_reward_count = 0
     black_reward_count = 0
 
-    # Diagnostic metrics
     defense_phases_seen = 0
     parry_phases_seen = 0
     move_phases_seen = 0
     total_legal_actions = 0
     game_lengths = []
-    
 
     network.eval()
     with torch.no_grad():
         for t in range(T):
             legal_mask = env.get_legal_mask()
 
-            # Track phase distribution
             move_phases_seen += (env.phase == 0).sum().item()
             defense_phases_seen += (env.phase == 1).sum().item()
             parry_phases_seen += (env.phase == 2).sum().item()
             total_legal_actions += legal_mask.sum().item()
 
-            # Ensure at least one action is legal
             no_legal = ~legal_mask.any(dim=1)
             if no_legal.any():
                 legal_mask[no_legal, 4162] = True
 
-            # Use AMP for inference if enabled
             with torch.amp.autocast('cuda', enabled=use_amp):
                 action, log_prob, entropy, value = network.get_action_and_value(obs, legal_mask)
 
@@ -113,8 +105,7 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
 
             buffer.insert(obs, action, log_prob, reward, done, value, legal_mask)
 
-            # ── NEW: accumulate per-color rewards ──
-            agent_w = env.agent_is_white  # (N,) bool — which color is "the agent" in each env
+            agent_w = env.agent_is_white
             white_mask = agent_w
             black_mask = ~agent_w
 
@@ -123,7 +114,6 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
             white_reward_count += white_mask.sum().item()
             black_reward_count += black_mask.sum().item()
 
-            # Track stats
             if done.any():
                 n_done = done.sum().item()
                 games_completed += n_done
@@ -132,7 +122,6 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
                 black_wins += (results == 2).sum().item()
                 draws += (results == 3).sum().item()
 
-                # Track game lengths
                 move_counts = info["full_move_count"][done]
                 for mc in move_counts:
                     game_lengths.append(mc.item())
@@ -149,12 +138,10 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
         "rollout/white_wins": white_wins,
         "rollout/black_wins": black_wins,
         "rollout/draws": draws,
-        # Diagnostic metrics
         "rollout/phase_move_frac": move_phases_seen / total_steps,
         "rollout/phase_defense_frac": defense_phases_seen / total_steps,
         "rollout/phase_parry_frac": parry_phases_seen / total_steps,
         "rollout/avg_legal_actions": total_legal_actions / total_steps,
-        # ── NEW: per-color rewards ──
         "rollout/white_mean_reward": white_reward_sum / max(white_reward_count, 1),
         "rollout/black_mean_reward": black_reward_sum / max(black_reward_count, 1),
     }
@@ -169,16 +156,42 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
         stats["game/max_length"] = max(game_lengths)
         stats["game/min_length"] = min(game_lengths)
 
-    # ── Parry outcome stats from environment ──
+    # ── Parry outcome stats ──
     parry_stats = env.get_and_reset_parry_stats()
     stats.update(parry_stats)
 
-    # Compute rates for TensorBoard (avoid div by zero)
     pt = parry_stats["parry/total"]
     if pt > 0:
         stats["parry/self_capture_rate"] = parry_stats["parry/self_capture"] / pt
         stats["parry/good_move_rate"] = parry_stats["parry/good_move"] / pt
         stats["parry/skip_rate"] = parry_stats["parry/skip"] / pt
         stats["parry/enemy_capture_rate"] = parry_stats["parry/enemy_capture"] / pt
+
+        # NEW v4: diagnostic rates
+        stats["parry/could_move_rate"] = parry_stats["parry/could_move"] / pt
+        stats["parry/could_enemy_capture_rate"] = parry_stats["parry/could_enemy_capture"] / pt
+
+        skip_total = parry_stats["parry/skip"]
+        if skip_total > 0:
+            stats["parry/skip_when_could_move_rate"] = parry_stats["parry/skip_when_could_move"] / skip_total
+            stats["parry/skip_when_could_capture_rate"] = parry_stats["parry/skip_when_could_capture"] / skip_total
+
+    # ── NEW v4: Capture quality stats ──
+    capture_stats = env.get_and_reset_capture_stats()
+    stats.update(capture_stats)
+    ct = capture_stats["capture/total"]
+    if ct > 0:
+        stats["capture/high_attacker_rate"] = capture_stats["capture/high_attacker"] / ct
+
+    # ── NEW v4: Check escape stats ──
+    check_stats = env.get_and_reset_check_stats()
+    stats.update(check_stats)
+    total_check_escapes = check_stats["check/escape_by_move"] + check_stats["check/escape_by_capture"]
+    if total_check_escapes > 0:
+        stats["check/escape_by_move_rate"] = check_stats["check/escape_by_move"] / total_check_escapes
+        stats["check/escape_by_capture_rate"] = check_stats["check/escape_by_capture"] / total_check_escapes
+    total_3rd = check_stats["check/3rd_attempt_capture"] + check_stats["check/3rd_attempt_move"]
+    if total_3rd > 0:
+        stats["check/3rd_attempt_move_rate"] = check_stats["check/3rd_attempt_move"] / total_3rd
 
     return obs, stats

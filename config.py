@@ -1,15 +1,18 @@
 """
 config.py — All hyperparameters for Chess Obscur PPO training.
 
-CHANGES v3 (parry fix + stability):
-- entropy_coef_min: 0.0005 -> 0.0015 (keep exploring, especially parry situations)
-- entropy_coef: 0.003 -> 0.005 (restart with more exploration if retraining)
-- entropy_coef_decay_steps: 100M -> 200M (slower decay)
-- clip_eps: 0.2 -> 0.15 (reduce policy instability, clipfrac was 0.25)
-- value_head_hidden: 256 -> 384 (value loss was still 0.46, needs more capacity)
-- ppo_epochs: 4 -> 3 (with smaller clip_eps, fewer epochs prevent overshooting)
-- num_minibatches: 4 -> 8 (smaller minibatches = more stable gradients)
-- REWARD_STEP_PENALTY via reward.py: -0.003 -> -0.002
+CHANGES v4 (aggression + parry activation + draw fix):
+- REWARD tuning: see reward.py for details
+- entropy_coef: 0.005 -> 0.008 (CRITICAL: entropy collapsed to 1.8, need more exploration)
+- entropy_coef_min: 0.0015 -> 0.003 (keep higher floor — was reaching 0.0015 and policy froze)
+- entropy_coef_decay_steps: 200M -> 400M (much slower decay, entropy crashed too fast)
+- clip_eps: 0.15 -> 0.18 (was too tight, clipfrac went to 0.55 during transition, now ~0.07 = under-training)
+- ppo_epochs: 3 -> 4 (with wider clip, we can do more epochs again)
+- num_minibatches: 8 -> 6 (slightly larger minibatches for more stable value loss)
+- value_head_hidden: 256 -> 512 (value loss EXPLODED to 3.8 — needs much more capacity)
+- value_coef: 1.0 -> 0.5 (reduce value loss weight to prevent value head from destabilizing policy)
+- max_game_steps: 120 -> 150 (start higher, games were too short early on)
+- curriculum_max_steps_cap: 300 -> 250 (cap lower — at 300, avg_length=364, too many draws)
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -27,14 +30,14 @@ class Config:
 
     # ── Environment ──
     num_envs: int = 2048         # parallel games on GPU (2048-4096 optimal on 5090)
-    max_game_steps: int = 120     # initial max steps before timeout draw
+    max_game_steps: int = 150     # CHANGED: 120 -> 150 initial max steps
 
     # ── Curriculum: progressive max_steps increase ──
     curriculum_enabled: bool = True
-    curriculum_start_steps: int = 120      # starting max_steps
-    curriculum_step_increase: int = 15     # transition douce
+    curriculum_start_steps: int = 150      # CHANGED: 120 -> 150
+    curriculum_step_increase: int = 10     # CHANGED: 15 -> 10 (slower increase)
     curriculum_every_n_timesteps: int = 5_000_000  # every 5M timesteps
-    curriculum_max_steps_cap: int = 300    # ne jamais dépasser 300 steps
+    curriculum_max_steps_cap: int = 250    # CHANGED: 300 -> 250 (KEY FIX: 300 was causing 75% draws)
 
     # ── Observation ──
     obs_planes: int = 19
@@ -55,22 +58,22 @@ class Config:
     # ── Network ──
     num_res_blocks: int = 10
     num_filters: int = 128
-    value_head_hidden: int = 256     # CHANGED: 256 -> 384, value loss was high
+    value_head_hidden: int = 512     # CHANGED: 256 -> 512, value loss exploded to 3.8
     policy_head_filters: int = 32
 
     # ── PPO ──
     lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_eps: float = 0.15           # CHANGED: 0.2 -> 0.15, reduce policy instability
+    clip_eps: float = 0.18           # CHANGED: 0.15 -> 0.18, clipfrac was 0.07 = under-learning
     clip_value: float = 0.5
-    entropy_coef: float = 0.005      # CHANGED: 0.003 -> 0.005, more initial exploration
-    entropy_coef_min: float = 0.0015  # CHANGED: 0.0005 -> 0.0015, keep exploring parry
-    entropy_coef_decay_steps: int = 200_000_000  # CHANGED: 100M -> 200M, slower decay
-    value_coef: float = 1.0
+    entropy_coef: float = 0.008      # CHANGED: 0.005 -> 0.008, entropy died at 1.8
+    entropy_coef_min: float = 0.003   # CHANGED: 0.0015 -> 0.003, higher floor
+    entropy_coef_decay_steps: int = 400_000_000  # CHANGED: 200M -> 400M, MUCH slower
+    value_coef: float = 0.5          # CHANGED: 1.0 -> 0.5, stabilize value head
     max_grad_norm: float = 0.5
-    ppo_epochs: int = 3              # CHANGED: 4 -> 3, prevent overshooting with tighter clip
-    num_minibatches: int = 8         # CHANGED: 4 -> 8, more stable gradients
+    ppo_epochs: int = 4              # CHANGED: 3 -> 4, more epochs with wider clip
+    num_minibatches: int = 6         # CHANGED: 8 -> 6, larger minibatches
 
     # ── Rollout ──
     rollout_steps: int = 256         # steps per env before PPO update
