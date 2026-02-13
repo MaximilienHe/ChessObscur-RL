@@ -785,7 +785,7 @@ class ChessObscurEnv:
             self.check_attempts[i, actor_ci] += 1
             current = self.check_attempts[i, actor_ci].item()
             
-            agent_is_checker = (not actor_w = self.agent_is_white[i].item())
+            agent_is_checker = (not actor_w == self.agent_is_white[i].item())
             
             agent_is_actor = (actor_w == self.agent_is_white[i].item())
             if agent_is_actor:
