@@ -66,11 +66,11 @@ class Config:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.18           # CHANGED: 0.15 -> 0.18, clipfrac was 0.07 = under-learning
-    clip_value: float = 0.5
+    clip_value: float = 0.0          # TO DO : Might get back to 0.5 or 1.5 if too much instability
     entropy_coef: float = 0.008      # CHANGED: 0.005 -> 0.008, entropy died at 1.8
     entropy_coef_min: float = 0.003   # CHANGED: 0.0015 -> 0.003, higher floor
     entropy_coef_decay_steps: int = 400_000_000  # CHANGED: 200M -> 400M, MUCH slower
-    value_coef: float = 0.5          # CHANGED: 1.0 -> 0.5, stabilize value head
+    value_coef: float = 0.25          # CHANGED: 1.0 -> 0.5, stabilize value head
     max_grad_norm: float = 0.5
     ppo_epochs: int = 4              # CHANGED: 3 -> 4, more epochs with wider clip
     num_minibatches: int = 6         # CHANGED: 8 -> 6, larger minibatches

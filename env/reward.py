@@ -10,30 +10,38 @@ from env.move_tables import EMPTY
 
 
 # ── Terminal rewards ──
-REWARD_WIN = 1.0
+REWARD_WIN = 1.5
 REWARD_LOSE = -1.0
-REWARD_DRAW = -0.5
+REWARD_DRAW = -0.8
+
+BASE_DRAW_REWARD = -0.9
+MATERIAL_SCALE = 0.15
 
 # ── Intermediate shaping ──
-REWARD_CAPTURE_SCALE = 0.20
+REWARD_CAPTURE_SCALE = 0.25
 REWARD_LOSE_PIECE_SCALE = -0.06
-REWARD_CHECK_GIVEN = 0.06
-REWARD_BLOCK_SUCCESS = 0.05
-REWARD_PARRY_SUCCESS = 0.18
-REWARD_DEFENSE_FAIL = -0.01
-REWARD_ACCEPT_LOSS = -0.04
-REWARD_PARRY_MOVE_GOOD = 0.15
-REWARD_PARRY_SELF_CAPTURE = -0.30       # harsh penalty (* piece_value)
-REWARD_PARRY_SKIP = -0.03
-REWARD_CHECK_ATTEMPT_PENALTY = -0.05
-REWARD_STEP_PENALTY = -0.003
-
-# ── Capture quality bonus ──
-REWARD_CAPTURE_ATTACKER_BONUS = 0.02
 
 # ── Check escape shaping ──
 REWARD_CHECK_ESCAPE_MOVE = 0.03
 REWARD_CHECK_3RD_CAPTURE_PENALTY = -0.08
+REWARD_CHECK_GIVEN = 0.15
+REWARD_CHECK_2ND_ATTEMPT = 0.25
+REWARD_CHECK_ATTEMPT_PENALTY = -0.08
+
+REWARD_BLOCK_SUCCESS = 0.05
+REWARD_DEFENSE_FAIL = -0.01
+REWARD_ACCEPT_LOSS = -0.04
+
+REWARD_PARRY_SUCCESS = 0.18
+REWARD_PARRY_MOVE_GOOD = 0.15
+REWARD_PARRY_SELF_CAPTURE = -0.30       # harsh penalty (* piece_value)
+REWARD_PARRY_SKIP = -0.03
+
+REWARD_STEP_PENALTY = -0.005
+
+# ── Capture quality bonus ──
+REWARD_CAPTURE_ATTACKER_BONUS = 0.02
+
 
 
 def compute_material(board: torch.Tensor, piece_values: torch.Tensor, 
@@ -87,8 +95,8 @@ def reward_terminal(result_code: torch.Tensor, active_is_white: torch.Tensor,
 
         if timeout_draws.any() and board is not None and piece_values is not None:
             material_advantage = compute_material(board, piece_values, active_is_white)
-            base_draw_reward = -0.6
-            material_scale = 0.25
+            base_draw_reward = BASE_DRAW_REWARD
+            material_scale = MATERIAL_SCALE
             normalized_advantage = torch.tanh(material_advantage / 10.0)
             timeout_reward = base_draw_reward + material_scale * normalized_advantage
             reward = torch.where(timeout_draws, timeout_reward, reward)

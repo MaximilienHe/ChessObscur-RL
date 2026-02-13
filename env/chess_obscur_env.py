@@ -28,6 +28,7 @@ from env.reward import (
     REWARD_STEP_PENALTY, REWARD_CHECK_ATTEMPT_PENALTY,
     REWARD_CAPTURE_ATTACKER_BONUS,
     REWARD_CHECK_ESCAPE_MOVE, REWARD_CHECK_3RD_CAPTURE_PENALTY,
+    REWARD_CHECK_GIVEN, REWARD_CHECK_2ND_ATTEMPT
 )
 
 PHASE_MOVE = 0
@@ -782,9 +783,17 @@ class ChessObscurEnv:
 
         if actor_in_check:
             self.check_attempts[i, actor_ci] += 1
+            current = self.check_attempts[i, actor_ci].item()
+            
+            agent_is_checker = (not actor_w = self.agent_is_white[i].item())
+            
             agent_is_actor = (actor_w == self.agent_is_white[i].item())
             if agent_is_actor:
                 reward[i] += REWARD_CHECK_ATTEMPT_PENALTY
+            else:
+                reward[i] += REWARD_CHECK_GIVEN
+                if current >= 2:
+                    reward[i] += REWARD_CHECK_2ND_ATTEMPT
 
             self.turn_is_white[i] = actor_w
             self.phase[i] = PHASE_MOVE
