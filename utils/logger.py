@@ -1,10 +1,10 @@
 """
 logger.py — TensorBoard + console logging.
 
-CHANGES v4:
-- Log parry diagnostic rates (could_move, skip_when_could_*)
-- Log capture quality (high_attacker rate)
-- Log check escape behavior (3rd attempt move rate)
+CHANGES v5:
+- Removed parry/enemy_capture logs (illegal move removed)
+- Removed parry diagnostic logs (could_move, skip_when_*)
+- Parry stats: self_capture_rate, good_move_rate, skip_rate only
 """
 import os
 import time
@@ -60,23 +60,16 @@ class Logger:
         if avg_reward is not None:
             parts.append(f"mean_rew={avg_reward:.4f}")
 
-        # Parry stats (basic)
-        for key in ["parry/self_capture_rate", "parry/good_move_rate",
-                     "parry/skip_rate", "parry/enemy_capture_rate"]:
+        # Parry stats (3 outcomes: skip, good_move, self_capture)
+        for key in ["parry/self_capture_rate", "parry/good_move_rate", "parry/skip_rate"]:
             if key in metrics:
                 parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
 
-        # NEW v4: Parry diagnostics
-        for key in ["parry/could_move_rate", "parry/skip_when_could_move_rate",
-                     "parry/skip_when_could_capture_rate"]:
-            if key in metrics:
-                parts.append(f"{key.split('/')[-1]}={metrics[key]:.3f}")
-
-        # NEW v4: Capture quality
+        # Capture quality
         if "capture/high_attacker_rate" in metrics:
             parts.append(f"high_atk_rate={metrics['capture/high_attacker_rate']:.3f}")
 
-        # NEW v4: Check escape
+        # Check escape
         if "check/3rd_attempt_move_rate" in metrics:
             parts.append(f"3rd_chk_move={metrics['check/3rd_attempt_move_rate']:.3f}")
 

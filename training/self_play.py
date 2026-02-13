@@ -1,11 +1,10 @@
 """
 self_play.py — Self-play rollout collection.
 
-CHANGES v4:
-- Collect richer parry diagnostics (could_move, could_capture, skip_when_could_*)
-- Collect capture quality stats (high_attacker usage)
-- Collect check escape stats (escape by move vs capture, 3rd attempt behavior)
-- Compute rates for all new metrics
+CHANGES v5:
+- Removed all parry/enemy_capture stats (illegal move removed)
+- Parry stats now track only 3 outcomes: skip, good_move, self_capture
+- Removed parry diagnostic counters (could_move, could_enemy_capture, skip_when_*)
 """
 import torch
 import time
@@ -156,7 +155,7 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
         stats["game/max_length"] = max(game_lengths)
         stats["game/min_length"] = min(game_lengths)
 
-    # ── Parry outcome stats ──
+    # ── Parry stats: 3 outcomes only (skip, good_move, self_capture) ──
     parry_stats = env.get_and_reset_parry_stats()
     stats.update(parry_stats)
 
@@ -165,25 +164,15 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
         stats["parry/self_capture_rate"] = parry_stats["parry/self_capture"] / pt
         stats["parry/good_move_rate"] = parry_stats["parry/good_move"] / pt
         stats["parry/skip_rate"] = parry_stats["parry/skip"] / pt
-        stats["parry/enemy_capture_rate"] = parry_stats["parry/enemy_capture"] / pt
 
-        # NEW v4: diagnostic rates
-        stats["parry/could_move_rate"] = parry_stats["parry/could_move"] / pt
-        stats["parry/could_enemy_capture_rate"] = parry_stats["parry/could_enemy_capture"] / pt
-
-        skip_total = parry_stats["parry/skip"]
-        if skip_total > 0:
-            stats["parry/skip_when_could_move_rate"] = parry_stats["parry/skip_when_could_move"] / skip_total
-            stats["parry/skip_when_could_capture_rate"] = parry_stats["parry/skip_when_could_capture"] / skip_total
-
-    # ── NEW v4: Capture quality stats ──
+    # ── Capture quality stats ──
     capture_stats = env.get_and_reset_capture_stats()
     stats.update(capture_stats)
     ct = capture_stats["capture/total"]
     if ct > 0:
         stats["capture/high_attacker_rate"] = capture_stats["capture/high_attacker"] / ct
 
-    # ── NEW v4: Check escape stats ──
+    # ── Check escape stats ──
     check_stats = env.get_and_reset_check_stats()
     stats.update(check_stats)
     total_check_escapes = check_stats["check/escape_by_move"] + check_stats["check/escape_by_capture"]

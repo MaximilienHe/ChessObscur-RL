@@ -2,26 +2,9 @@
 """
 evaluate_model.py — Comprehensive evaluation of Chess Obscur RL models.
 
-Tests:
-1. Overall win/draw/loss rates (self-play)
-2. Parry behavior analysis (self-capture frequency, skip rate)
-3. Defense phase decisions (block vs parry vs accept_loss distribution)
-4. Material efficiency (avg material at game end)
-5. Game length distribution
-6. Comparison between two checkpoints (A vs B)
-
-Usage:
-    # Basic eval
-    python evaluate_model.py --checkpoint checkpoints/step_158072832.pt --device cuda
-    
-    # Compare two checkpoints
-    python evaluate_model.py --checkpoint-a checkpoints/step_100000000.pt \\
-                             --checkpoint-b checkpoints/step_158072832.pt \\
-                             --device cuda --num-games 500
-    
-    # Detailed parry analysis
-    python evaluate_model.py --checkpoint checkpoints/step_158072832.pt \\
-                             --parry-analysis --num-games 1000
+CHANGES v5:
+- Removed parry/enemy_capture tracking (illegal move removed)
+- Parry stats: skip, good_move, self_capture only
 """
 import os
 import sys
@@ -54,7 +37,6 @@ def load_model(checkpoint_path, cfg, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt.get("model_state_dict", ckpt)
     
-    # Strip _orig_mod prefix if present
     new_state_dict = {}
     for key, value in state_dict.items():
         if key.startswith("_orig_mod."):
@@ -72,21 +54,6 @@ def load_model(checkpoint_path, cfg, device):
 
 def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
                    temperature=0.0, detailed=False):
-    """
-    Run self-play evaluation and collect detailed statistics.
-    
-    Args:
-        network: The model to evaluate
-        cfg: Config object
-        num_games: Total games to play
-        num_envs: Parallel environments
-        device: cuda or cpu
-        temperature: 0 = greedy, >0 = sampling
-        detailed: Whether to track per-game parry details
-    
-    Returns:
-        stats dict with all metrics
-    """
     num_envs = min(num_envs, num_games)
     env = ChessObscurEnv(num_envs, device=device, max_steps=300)
     obs = env.reset()
@@ -97,20 +64,16 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
         "black_wins": 0,
         "draws": 0,
         "game_lengths": [],
-        # Defense stats
         "defense_block": 0,
         "defense_parry": 0,
         "defense_accept": 0,
         "defense_total": 0,
-        # Parry stats
+        # Parry: 3 outcomes only
         "parry_skip": 0,
         "parry_self_capture": 0,
         "parry_good_move": 0,
-        "parry_enemy_capture": 0,
         "parry_total": 0,
-        # Material stats
         "final_material_advantage": [],
-        # Phase distribution
         "steps_move": 0,
         "steps_defense": 0,
         "steps_parry": 0,
@@ -118,19 +81,17 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
     }
     
     step_count = 0
-    max_steps_per_game = 600 * 2  # Safety limit
+    max_steps_per_game = 600 * 2
     
     with torch.no_grad():
         while stats["games_completed"] < num_games:
             legal_mask = env.get_legal_mask()
             
-            # Track phase distribution
             stats["steps_move"] += (env.phase == PHASE_MOVE).sum().item()
             stats["steps_defense"] += (env.phase == PHASE_DEFENSE).sum().item()
             stats["steps_parry"] += (env.phase == PHASE_PARRY).sum().item()
             stats["total_steps"] += num_envs
             
-            # Ensure at least one legal action
             no_legal = ~legal_mask.any(dim=1)
             if no_legal.any():
                 legal_mask[no_legal, 4162] = True
@@ -145,7 +106,7 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
             else:
                 actions = policy_logits.argmax(dim=-1)
             
-            # ── Track defense decisions BEFORE step ──
+            # Track defense decisions
             in_def = env.phase == PHASE_DEFENSE
             if in_def.any():
                 def_actions = actions[in_def]
@@ -154,7 +115,7 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
                 stats["defense_parry"] += (def_actions == 4161).sum().item()
                 stats["defense_accept"] += (def_actions == 4162).sum().item()
             
-            # ── Track parry decisions BEFORE step ──
+            # Track parry decisions (3 outcomes)
             in_parry = env.phase == PHASE_PARRY
             if in_parry.any():
                 parry_actions = actions[in_parry]
@@ -165,7 +126,7 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
                     stats["parry_total"] += 1
                     
                     if a >= 4096:
-                        continue  # shouldn't happen in parry
+                        continue
                     
                     fs = a // 64
                     ts = a % 64
@@ -173,19 +134,13 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
                     if fs == ts:
                         stats["parry_skip"] += 1
                     else:
-                        # Check what's on the target square
                         i = idx.item()
                         target_piece = env.board[i, ts].item()
                         if target_piece == 0:
-                            stats["parry_good_move"] += 1  # empty square
+                            stats["parry_good_move"] += 1
                         else:
-                            # Is target own piece (self-capture)?
-                            ctrl_w = env.parry_controller_is_white[i].item()
-                            target_is_white = (1 <= target_piece <= 6)
-                            if ctrl_w == target_is_white:
-                                stats["parry_self_capture"] += 1
-                            else:
-                                stats["parry_enemy_capture"] += 1
+                            # Any capture during parry is self-capture
+                            stats["parry_self_capture"] += 1
             
             obs, reward, done, info = env.step(actions)
             step_count += 1
@@ -214,7 +169,6 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
 
 
 def print_stats(stats, label="Evaluation"):
-    """Print formatted evaluation statistics."""
     total = stats["games_completed"]
     if total == 0:
         print(f"\n{label}: No games completed!")
@@ -224,7 +178,6 @@ def print_stats(stats, label="Evaluation"):
     print(f"  {label} — {total} games")
     print(f"{'=' * 70}")
     
-    # Win/Draw/Loss
     ww = stats["white_wins"]
     bw = stats["black_wins"]
     dr = stats["draws"]
@@ -234,7 +187,6 @@ def print_stats(stats, label="Evaluation"):
     print(f"    Draws:       {dr:>5} ({dr/total*100:5.1f}%)")
     print(f"    Win rate:    {(ww+bw)/total*100:5.1f}%")
     
-    # Game lengths
     lengths = stats["game_lengths"]
     if lengths:
         print(f"\n  Game Length:")
@@ -243,7 +195,6 @@ def print_stats(stats, label="Evaluation"):
         print(f"    Min:     {min(lengths):6.1f}")
         print(f"    Max:     {max(lengths):6.1f}")
     
-    # Phase distribution
     ts = stats["total_steps"]
     if ts > 0:
         print(f"\n  Phase Distribution:")
@@ -251,7 +202,6 @@ def print_stats(stats, label="Evaluation"):
         print(f"    Defense: {stats['steps_defense']/ts*100:5.1f}%")
         print(f"    Parry:   {stats['steps_parry']/ts*100:5.1f}%")
     
-    # Defense decisions
     dt = stats["defense_total"]
     if dt > 0:
         print(f"\n  Defense Decisions ({dt} total):")
@@ -259,26 +209,22 @@ def print_stats(stats, label="Evaluation"):
         print(f"    Parry:       {stats['defense_parry']:>5} ({stats['defense_parry']/dt*100:5.1f}%)")
         print(f"    Accept loss: {stats['defense_accept']:>5} ({stats['defense_accept']/dt*100:5.1f}%)")
     
-    # Parry decisions - THE KEY METRIC
     pt = stats["parry_total"]
     if pt > 0:
-        print(f"\n  ⚡ Parry Decisions ({pt} total):")
+        print(f"\n  Parry Decisions ({pt} total):")
         print(f"    Skip (no move):    {stats['parry_skip']:>5} ({stats['parry_skip']/pt*100:5.1f}%)")
         print(f"    Good move (empty): {stats['parry_good_move']:>5} ({stats['parry_good_move']/pt*100:5.1f}%)")
-        print(f"    Enemy capture:     {stats['parry_enemy_capture']:>5} ({stats['parry_enemy_capture']/pt*100:5.1f}%)")
-        print(f"    ❌ SELF-CAPTURE:   {stats['parry_self_capture']:>5} ({stats['parry_self_capture']/pt*100:5.1f}%)")
+        print(f"    SELF-CAPTURE:      {stats['parry_self_capture']:>5} ({stats['parry_self_capture']/pt*100:5.1f}%)")
         
         if stats['parry_self_capture'] / pt > 0.15:
-            print(f"\n    ⚠️  SELF-CAPTURE RATE IS HIGH ({stats['parry_self_capture']/pt*100:.1f}%)")
-            print(f"    The agent is eating its own pieces during parry too often!")
+            print(f"\n    WARNING: SELF-CAPTURE RATE IS HIGH ({stats['parry_self_capture']/pt*100:.1f}%)")
         elif stats['parry_self_capture'] / pt < 0.05:
-            print(f"\n    ✓  Self-capture rate is low ({stats['parry_self_capture']/pt*100:.1f}%) — good!")
+            print(f"\n    OK: Self-capture rate is low ({stats['parry_self_capture']/pt*100:.1f}%)")
     
     print(f"\n{'=' * 70}")
 
 
 def compare_models(stats_a, stats_b, label_a="Model A", label_b="Model B"):
-    """Compare two model evaluations side by side."""
     print(f"\n{'=' * 70}")
     print(f"  COMPARISON: {label_a} vs {label_b}")
     print(f"{'=' * 70}")
@@ -314,7 +260,7 @@ def compare_models(stats_a, stats_b, label_a="Model A", label_b="Model B"):
         va = fn(stats_a)
         vb = fn(stats_b)
         delta = vb - va
-        arrow = "↑" if delta > 0 else "↓" if delta < 0 else "="
+        arrow = "^" if delta > 0 else "v" if delta < 0 else "="
         print(f"  {name:<20} {va:>10.1f}{unit} {vb:>10.1f}{unit}   {arrow} {abs(delta):>7.1f}{unit}")
     
     print(f"\n{'=' * 70}")
@@ -322,16 +268,15 @@ def compare_models(stats_a, stats_b, label_a="Model A", label_b="Model B"):
 
 def main():
     parser = argparse.ArgumentParser(description="Chess Obscur Model Evaluation")
-    parser.add_argument("--checkpoint", default=None, help="Single model to evaluate")
-    parser.add_argument("--checkpoint-a", default=None, help="First model for comparison")
-    parser.add_argument("--checkpoint-b", default=None, help="Second model for comparison")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--checkpoint-a", default=None)
+    parser.add_argument("--checkpoint-b", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-games", type=int, default=500)
     parser.add_argument("--num-envs", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.0, help="0=greedy, >0=sampling")
-    parser.add_argument("--parry-analysis", action="store_true", help="Extra parry detail")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--parry-analysis", action="store_true")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
-    # Override config for value_head_hidden if loading old model
     parser.add_argument("--value-head-hidden", type=int, default=None)
     parser.add_argument("--num-res-blocks", type=int, default=None)
     parser.add_argument("--num-filters", type=int, default=None)
@@ -352,7 +297,6 @@ def main():
         cfg.device = "cpu"
     
     if args.checkpoint_a and args.checkpoint_b:
-        # Compare two models
         print(f"\n[eval] Comparing two models with {args.num_games} games each")
         
         print(f"\n[eval] Loading Model A...")
@@ -381,7 +325,6 @@ def main():
         compare_models(stats_a, stats_b, label_a, label_b)
     
     else:
-        # Single model evaluation
         ckpt = args.checkpoint
         if ckpt == "latest" or ckpt is None:
             ckpt = find_latest_checkpoint(args.checkpoint_dir)

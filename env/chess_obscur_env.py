@@ -1,12 +1,15 @@
 """
 chess_obscur_env.py — Fully vectorized GPU Chess Obscur environment.
 
-CHANGES v4 (aggression + parry diagnostic + smart check escape):
-  1. RICHER PARRY STATS: Track what options were available when parry decision was made
-  2. CAPTURE QUALITY: When capturing, bonus if attacker has higher attack stat  
-  3. SMART CHECK ESCAPE: On 3rd check attempt, penalize capture attempts, reward safe moves
-  4. PARRY SKIP PENALTY: skip is now penalized (was neutral)
-  5. Draw penalty increase via reward.py
+CHANGES v5 (parry rules fix):
+  FIX: Removed illegal "enemy capture" during parry phase.
+  During parry, the controller moves the attacker's piece. Legal outcomes are:
+    1. SKIP (from == to): don't move the piece
+    2. GOOD MOVE: move to an empty square
+    3. SELF-CAPTURE: move onto controller's own piece (bad)
+  Moving the parried piece onto another piece of the same color as the parried
+  piece is NOT allowed (it would mean eating your own teammate, which makes no
+  sense from the attacker's perspective and is not in the game rules).
 """
 import torch
 from typing import Tuple, Optional, Dict
@@ -64,24 +67,17 @@ class ChessObscurEnv:
         self.parry_controller_is_white = torch.zeros(num_envs, dtype=torch.bool, device=dev)
         self.agent_is_white = torch.ones(num_envs, dtype=torch.bool, device=dev)
 
-        # ── Parry outcome counters (basic) ──
+        # ── Parry outcome counters (3 outcomes only: skip, good_move, self_capture) ──
         self.parry_self_capture_count = 0
         self.parry_good_move_count = 0
         self.parry_skip_count = 0
-        self.parry_enemy_capture_count = 0
         self.parry_total_count = 0
 
-        # ── NEW v4: Richer parry diagnostics ──
-        self.parry_could_move_count = 0
-        self.parry_could_enemy_capture_count = 0
-        self.parry_chose_skip_when_could_move = 0
-        self.parry_chose_skip_when_could_capture = 0
-
-        # ── NEW v4: Capture quality stats ──
+        # ── Capture quality stats ──
         self.capture_total_count = 0
         self.capture_high_attacker_count = 0
 
-        # ── NEW v4: Check escape stats ──
+        # ── Check escape stats ──
         self.check_escape_by_move_count = 0
         self.check_escape_by_capture_count = 0
         self.check_3rd_attempt_capture_count = 0
@@ -166,21 +162,11 @@ class ChessObscurEnv:
             "parry/self_capture": self.parry_self_capture_count,
             "parry/good_move": self.parry_good_move_count,
             "parry/skip": self.parry_skip_count,
-            "parry/enemy_capture": self.parry_enemy_capture_count,
-            "parry/could_move": self.parry_could_move_count,
-            "parry/could_enemy_capture": self.parry_could_enemy_capture_count,
-            "parry/skip_when_could_move": self.parry_chose_skip_when_could_move,
-            "parry/skip_when_could_capture": self.parry_chose_skip_when_could_capture,
         }
         self.parry_total_count = 0
         self.parry_self_capture_count = 0
         self.parry_good_move_count = 0
         self.parry_skip_count = 0
-        self.parry_enemy_capture_count = 0
-        self.parry_could_move_count = 0
-        self.parry_could_enemy_capture_count = 0
-        self.parry_chose_skip_when_could_move = 0
-        self.parry_chose_skip_when_could_capture = 0
         return stats
 
     def get_and_reset_capture_stats(self):
@@ -474,118 +460,94 @@ class ChessObscurEnv:
             pcs = bds[torch.arange(M, device=dev), p_sq]
             pc_is_w = (pcs>=1)&(pcs<=6)
 
-            pseudo = self._gen_pseudo_legal_batched(bds, pc_is_w, self.en_passant[idx], self.castling[idx])
+            # ── v5 FIX: Build parry legal mask manually ──
+            # During parry, the controller moves the parried piece.
+            # Legal targets: empty squares OR controller's own pieces (self-capture).
+            # NOT legal: pieces of the same color as the parried piece (enemy capture is illegal).
 
-            p64 = pseudo.view(M,64,64)
-            pm = torch.zeros(M,64,64, dtype=torch.bool, device=dev)
-            pm[torch.arange(M,device=dev), p_sq] = p64[torch.arange(M,device=dev), p_sq]
+            pm = torch.zeros(M, 64, 64, dtype=torch.bool, device=dev)
 
-            pt = torch.where(pcs<=6, pcs-1, pcs-7).clamp(min=0)
-            is_kg = (pt==5)
-            if is_kg.any():
-                ki = torch.arange(M,device=dev)[is_kg]
-                for fr,to in [(4,6),(4,2),(60,62),(60,58)]:
-                    pm[ki, fr, to] = False
-
-            ctrl_own = torch.where(ctrl_w.unsqueeze(1), (bds>=1)&(bds<=6), (bds>=7)&(bds<=12))
             for mi in range(M):
-                sq = p_sq[mi].item(); pc = pcs[mi].item()
-                if pc == EMPTY: continue
-                pty = (pc-1) if pc<=6 else (pc-7)
-                if pty == 1: tgts = self.knight_attack_table[sq]
-                elif pty == 5: tgts = self.king_attack_table[sq]
-                elif pty in (2,3,4):
-                    occ = bds[mi]!=EMPTY
-                    al = self.ray_aligned[sq]; rt = self.ray_type[sq]
+                sq = p_sq[mi].item()
+                pc = pcs[mi].item()
+                if pc == EMPTY:
+                    continue
+
+                pty = (pc - 1) if pc <= 6 else (pc - 7)
+                piece_is_white = (1 <= pc <= 6)
+                controller_is_white = ctrl_w[mi].item()
+
+                # Get reachable squares for this piece type
+                if pty == 1:  # Knight
+                    tgts = self.knight_attack_table[sq]
+                elif pty == 5:  # King
+                    tgts = self.king_attack_table[sq]
+                elif pty in (2, 3, 4):  # Bishop, Rook, Queen
+                    occ = bds[mi] != EMPTY
+                    al = self.ray_aligned[sq]
+                    rt = self.ray_type[sq]
                     blk = (self.between_mask[sq] & occ.unsqueeze(0)).any(dim=1)
-                    if pty==2: tgts = al & (rt==1) & ~blk
-                    elif pty==3: tgts = al & (rt==2) & ~blk
-                    else: tgts = al & ~blk
-                elif pty == 0:
-                    pw = (1<=pc<=6)
-                    ct = self.tables.w_pawn_caps if pw else self.tables.b_pawn_caps
+                    if pty == 2:    # Bishop
+                        tgts = al & (rt == 1) & ~blk
+                    elif pty == 3:  # Rook
+                        tgts = al & (rt == 2) & ~blk
+                    else:           # Queen
+                        tgts = al & ~blk
+                elif pty == 0:  # Pawn
+                    # Pawn in parry: forward moves + capture diagonals
+                    # (captures here = self-capture onto controller's pieces)
                     tgts = torch.zeros(64, dtype=torch.bool, device=dev)
+                    if piece_is_white:
+                        fw = self.tables.w_pawn_fwd1[sq].item()
+                        ct = self.tables.w_pawn_caps
+                    else:
+                        fw = self.tables.b_pawn_fwd1[sq].item()
+                        ct = self.tables.b_pawn_caps
+                    # Forward move (only to empty)
+                    if fw >= 0 and bds[mi, fw].item() == EMPTY:
+                        tgts[fw] = True
+                    # Capture diagonals
                     for ci in range(2):
-                        t = ct[sq,ci].item()
-                        if t>=0: tgts[t] = True
-                else: continue
-                sc = tgts & ctrl_own[mi]
-                if sc.any(): pm[mi, sq] |= sc
+                        t = ct[sq, ci].item()
+                        if t >= 0:
+                            tgts[t] = True
+                else:
+                    continue
+
+                # Filter targets: only allow empty squares and controller's own pieces
+                # Block moves to pieces of the parried piece's own color (= enemy from controller's POV... 
+                # but actually these are the parried piece's teammates, and you can't eat your own teammates)
+                for t_sq in tgts.nonzero(as_tuple=True)[0]:
+                    t_sq_i = t_sq.item()
+                    target_piece = bds[mi, t_sq_i].item()
+
+                    if target_piece == EMPTY:
+                        # Empty square = good move (always legal)
+                        pm[mi, sq, t_sq_i] = True
+                    else:
+                        target_is_white = (1 <= target_piece <= 6)
+                        if target_is_white == controller_is_white:
+                            # Target is controller's own piece = self-capture (legal but bad)
+                            pm[mi, sq, t_sq_i] = True
+                        # else: target is same color as parried piece = illegal (can't eat own teammates)
+
+            # No castling during parry
+            # (already not included since we build manually)
 
             pf = pm.view(M, 4096)
+
+            # King safety filter (don't leave parried piece's king in check)
             pf = self._filter_king_safety_batched(bds, pf, pc_is_w, self.en_passant[idx])
+
+            # Always allow skip (from == to)
             for mi_idx in range(M):
                 sq = p_sq[mi_idx].item()
                 skip_action = sq * 64 + sq
                 pf[mi_idx, skip_action] = True
+
             mask[in_parry, :4096] = pf
 
         return mask
-
-    # ══════════════════════════════════════════════
-    #  PARRY OPTION ANALYSIS (lightweight, for diagnostics)
-    # ══════════════════════════════════════════════
-
-    def _analyze_parry_options_fast(self, i):
-        """Quickly check what parry options exist for env i."""
-        bd = self.board[i]
-        p_sq = self.parry_square[i].item()
-        ctrl_w = self.parry_controller_is_white[i].item()
-        pc = bd[p_sq].item()
-        if pc == EMPTY:
-            return False, False
-
-        has_good_move = False
-        has_enemy_capture = False
-
-        pty = (pc-1) if pc<=6 else (pc-7)
-        pc_is_w = (1<=pc<=6)
-        dev = self.device
-
-        # Get reachable squares for this piece
-        if pty == 1:
-            tgts = self.knight_attack_table[p_sq]
-        elif pty == 5:
-            tgts = self.king_attack_table[p_sq]
-        elif pty in (2,3,4):
-            occ = bd!=EMPTY
-            al = self.ray_aligned[p_sq]; rt = self.ray_type[p_sq]
-            blk = (self.between_mask[p_sq] & occ.unsqueeze(0)).any(dim=1)
-            if pty==2: tgts = al & (rt==1) & ~blk
-            elif pty==3: tgts = al & (rt==2) & ~blk
-            else: tgts = al & ~blk
-        elif pty == 0:
-            # Pawn: forward moves + captures
-            ct = self.tables.w_pawn_caps if pc_is_w else self.tables.b_pawn_caps
-            fw = self.tables.w_pawn_fwd1 if pc_is_w else self.tables.b_pawn_fwd1
-            tgts = torch.zeros(64, dtype=torch.bool, device=dev)
-            for ci in range(2):
-                t = ct[p_sq,ci].item()
-                if t>=0: tgts[t] = True
-            fwd = fw[p_sq].item()
-            if fwd >= 0 and bd[fwd].item() == EMPTY:
-                tgts[fwd] = True
-        else:
-            return False, False
-
-        # Also add self-capture targets (controller's own pieces)
-        ctrl_own = (bd>=1)&(bd<=6) if ctrl_w else (bd>=7)&(bd<=12)
-        tgts_with_self = tgts | (tgts & False)  # start clean
-
-        for sq in tgts.nonzero(as_tuple=True)[0]:
-            sq_i = sq.item()
-            if sq_i == p_sq:
-                continue
-            target = bd[sq_i].item()
-            if target == EMPTY:
-                has_good_move = True
-            else:
-                target_is_white = (1 <= target <= 6)
-                if ctrl_w != target_is_white:
-                    has_enemy_capture = True
-                    has_good_move = True
-
-        return has_good_move, has_enemy_capture
 
     # ══════════════════════════════════════════════
     #  STEP
@@ -664,7 +626,6 @@ class ChessObscurEnv:
 
                 if agent_is_attacker:
                     reward[i] += REWARD_CAPTURE_SCALE * dv
-                    # v4: bonus for using high-attack piece
                     if atk_stat > def_stat:
                         reward[i] += REWARD_CAPTURE_ATTACKER_BONUS * (atk_stat - def_stat)
                         self.capture_high_attacker_count += 1
@@ -715,48 +676,33 @@ class ChessObscurEnv:
             if parry:
                 cw=self.parry_controller_is_white[i].item()
 
-                # v4: analyze options BEFORE taking action
-                has_good_move, has_enemy_capture = self._analyze_parry_options_fast(i)
-                if has_good_move:
-                    self.parry_could_move_count += 1
-                if has_enemy_capture:
-                    self.parry_could_enemy_capture_count += 1
-
+                # ── SKIP ──
                 if fs == ts:
                     self.parry_skip_count += 1
                     self.parry_total_count += 1
                     self.phase[i]=PHASE_MOVE; self.parry_square[i]=-1
                     reward[i]+=REWARD_PARRY_SKIP
-
-                    if has_good_move:
-                        self.parry_chose_skip_when_could_move += 1
-                    if has_enemy_capture:
-                        self.parry_chose_skip_when_could_capture += 1
-
                     self._enforce_check(i,cw,reward); continue
 
                 if ic:
+                    # v5 FIX: During parry, the only capture possible is self-capture
+                    # (controller's piece gets eaten). Enemy capture is blocked at the
+                    # legal mask level, but if it somehow gets here, treat as self-capture.
                     tw=1<=tgt<=6
-                    if cw==tw:
-                        self.parry_self_capture_count += 1
-                        self.parry_total_count += 1
-                        dt = (tgt-1) if tgt<=6 else (tgt-7)
-                        piece_val = self.tables.piece_values[dt].item()
-                        bd[ts]=bd[fs]; bd[fs]=EMPTY; self._post_move_updates(i,fs,ts)
-                        self.phase[i]=PHASE_MOVE; self.parry_square[i]=-1
-                        reward[i] += REWARD_PARRY_SELF_CAPTURE * piece_val
-                        self.half_moves[i]=0
-                        self._enforce_check(i,cw,reward); continue
-                    else:
-                        self.parry_enemy_capture_count += 1
-                        self.parry_total_count += 1
-                        from env.reward import REWARD_PARRY_ENEMY_CAPTURE
-                        agent_is_controller = (cw == self.agent_is_white[i].item())
-                        if agent_is_controller:
-                            reward[i] += REWARD_PARRY_ENEMY_CAPTURE
-                        self._start_defense(i,fs,ts,mv,tgt,cw); continue
+                    # This should always be self-capture (tw == cw) since enemy capture
+                    # is filtered out in get_legal_mask. But handle both for safety.
+                    self.parry_self_capture_count += 1
+                    self.parry_total_count += 1
+                    dt_val = (tgt-1) if tgt<=6 else (tgt-7)
+                    piece_val = self.tables.piece_values[dt_val].item()
+                    bd[ts]=bd[fs]; bd[fs]=EMPTY; self._post_move_updates(i,fs,ts)
+                    self.phase[i]=PHASE_MOVE; self.parry_square[i]=-1
+                    reward[i] += REWARD_PARRY_SELF_CAPTURE * piece_val
+                    self.half_moves[i]=0
+                    self._enforce_check(i,cw,reward); continue
 
                 else:
+                    # ── GOOD MOVE (empty square) ──
                     self.parry_good_move_count += 1
                     self.parry_total_count += 1
                     bd[ts]=bd[fs]; bd[fs]=EMPTY; self._post_move_updates(i,fs,ts)
@@ -764,14 +710,15 @@ class ChessObscurEnv:
                     reward[i]+=REWARD_PARRY_MOVE_GOOD
                     self._enforce_check(i,cw,reward); continue
 
-            # ── v4: Check escape shaping ──
+            # ── Normal move phase (not parry) ──
+
+            # ── Check escape shaping ──
             actor_ci = 0 if mw else 1
             current_check_attempts = self.check_attempts[i, actor_ci].item()
             is_in_check = current_check_attempts > 0
             agent_is_actor = (mw == self.agent_is_white[i].item())
 
             if is_in_check and current_check_attempts >= 2:
-                # 3rd check attempt
                 if ic:
                     self.check_3rd_attempt_capture_count += 1
                     if agent_is_actor:
@@ -791,8 +738,8 @@ class ChessObscurEnv:
 
                 self.en_passant[i]=-1
                 if pt==5:
-                    for (cw,f,t,rs,rd) in [(True,4,6,7,5),(True,4,2,0,3),(False,60,62,63,61),(False,60,58,56,59)]:
-                        if mw==cw and fs==f and ts==t:
+                    for (cw_c,f,t,rs,rd) in [(True,4,6,7,5),(True,4,2,0,3),(False,60,62,63,61),(False,60,58,56,59)]:
+                        if mw==cw_c and fs==f and ts==t:
                             bd[rd]=bd[rs]; bd[rs]=EMPTY
                 bd[ts]=bd[fs]; bd[fs]=EMPTY
                 if pt==0 and abs(fs//8-ts//8)==2:
