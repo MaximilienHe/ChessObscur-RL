@@ -54,7 +54,8 @@ class ChessObscurNetwork(nn.Module):
             nn.Linear(1 * 8 * 8, value_head_hidden),
             nn.ReLU(),
             nn.Linear(value_head_hidden, 1),
-            nn.Tanh(),
+            # No Tanh: returns can exceed [-1,1] with intermediate rewards accumulated
+            # over long games. Tanh caused value_loss=16-27 and KL explosion.
         )
 
         self._init_weights()

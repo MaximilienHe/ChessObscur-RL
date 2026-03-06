@@ -27,7 +27,7 @@ from env.reward import (
     REWARD_PARRY_SKIP, REWARD_PARRY_SELF_CAPTURE,
     REWARD_STEP_PENALTY, REWARD_CHECK_ATTEMPT_PENALTY,
     REWARD_CAPTURE_ATTACKER_BONUS,
-    REWARD_CHECK_ESCAPE_MOVE, REWARD_CHECK_3RD_CAPTURE_PENALTY,
+    REWARD_CHECK_ESCAPE_SUCCESS,  # v6: outcome-based, replaces action-type rewards
     REWARD_CHECK_GIVEN, REWARD_CHECK_2ND_ATTEMPT
 )
 
@@ -719,15 +719,16 @@ class ChessObscurEnv:
             is_in_check = current_check_attempts > 0
             agent_is_actor = (mw == self.agent_is_white[i].item())
 
+            # v6: counters kept for logging, but no action-type reward here.
+            # The escape reward is outcome-based and given in _enforce_check when
+            # check_attempts resets to 0 (confirmed escape). This removes the bias
+            # that was penalising valid captures (-0.08) and caused escape_by_move_rate
+            # to drop to 5%.
             if is_in_check and current_check_attempts >= 2:
                 if ic:
                     self.check_3rd_attempt_capture_count += 1
-                    if agent_is_actor:
-                        reward[i] += REWARD_CHECK_3RD_CAPTURE_PENALTY
                 else:
                     self.check_3rd_attempt_move_count += 1
-                    if agent_is_actor:
-                        reward[i] += REWARD_CHECK_ESCAPE_MOVE
 
             if ic:
                 if is_in_check:
@@ -805,7 +806,14 @@ class ChessObscurEnv:
                 self.phase[i] = PHASE_FINISHED
                 self.result[i] = RESULT_BLACK_WIN if actor_w else RESULT_WHITE_WIN
         else:
+            # v6: outcome-based check escape reward.
+            # Given only when the agent was in check and successfully escaped.
+            # Scales with urgency: more consecutive checks = more reward for escaping.
+            old_attempts = self.check_attempts[i, actor_ci].item()
             self.check_attempts[i, actor_ci] = 0
+            if old_attempts > 0 and (actor_w == self.agent_is_white[i].item()):
+                urgency = min(old_attempts, 2)
+                reward[i] += REWARD_CHECK_ESCAPE_SUCCESS * urgency
 
     def _check_endgame(self, reward):
         active = (self.phase==PHASE_MOVE)

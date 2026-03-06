@@ -53,18 +53,25 @@ def load_checkpoint(path: str, network: nn.Module, optimizer: torch.optim.Optimi
     return ckpt
 
 
-def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+def _step_from_path(path: str) -> int:
+    base = os.path.basename(path)
+    try:
+        return int(base.replace("step_", "").replace(".pt", ""))
+    except ValueError:
+        return -1
+
+
+def list_checkpoints(checkpoint_dir: str, descending: bool = False) -> list[str]:
     pattern = os.path.join(checkpoint_dir, "step_*.pt")
     files = glob.glob(pattern)
+    files.sort(key=_step_from_path, reverse=descending)
+    return files
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    files = list_checkpoints(checkpoint_dir, descending=False)
     if not files:
         return None
-    def step_from_path(p):
-        base = os.path.basename(p)
-        try:
-            return int(base.replace("step_", "").replace(".pt", ""))
-        except ValueError:
-            return 0
-    files.sort(key=step_from_path)
     return files[-1]
 
 

@@ -1,19 +1,44 @@
 """
 config.py — All hyperparameters for Chess Obscur PPO training.
 
-CHANGES v4 (aggression + parry activation + draw fix):
-- REWARD tuning: see reward.py for details
-- entropy_coef: 0.005 -> 0.008 (CRITICAL: entropy collapsed to 1.8, need more exploration)
-- entropy_coef_min: 0.0015 -> 0.003 (keep higher floor — was reaching 0.0015 and policy froze)
-- entropy_coef_decay_steps: 200M -> 400M (much slower decay, entropy crashed too fast)
-- clip_eps: 0.15 -> 0.18 (was too tight, clipfrac went to 0.55 during transition, now ~0.07 = under-training)
-- ppo_epochs: 3 -> 4 (with wider clip, we can do more epochs again)
-- num_minibatches: 8 -> 6 (slightly larger minibatches for more stable value loss)
-- value_head_hidden: 256 -> 512 (value loss EXPLODED to 3.8 — needs much more capacity)
-- value_coef: 1.0 -> 0.5 (reduce value loss weight to prevent value head from destabilizing policy)
-- max_game_steps: 120 -> 150 (start higher, games were too short early on)
-- curriculum_max_steps_cap: 300 -> 250 (cap lower — at 300, avg_length=364, too many draws)
+CHANGES v8 (fresh start — audit from 493M step run):
+- NETWORK: 10 blocks / 128 filters -> 15 blocks / 192 filters (~8.5M params vs ~2.5M)
+  Bigger network = more capacity, less likely to plateau early.
+- LR: linear decay to 0 -> cosine annealing with warm restarts + lr_min floor (3e-5).
+  Linear decay killed training after ~200M steps (clipfrac=0, KL=0, LR≈0).
+- LR WARM RESTARTS: every 100M steps, LR resets to lr * 0.5 (decaying ceiling).
+  This periodically re-injects learning capacity to escape local optima.
+- LEAGUE TRAINING: 30% of games played against random past checkpoints.
+  Breaks the Nash draw equilibrium (79% draws) by forcing exploitation of weaker policies.
+- REWARD: progressive draw penalty based on game duration (see reward.py).
+- REWARD: parry good_move 0.15->0.30, parry skip -0.03->-0.08 (parry under-exploited).
+- value_head_hidden: 512 -> 1024 (bigger value head for bigger backbone).
+- policy_head_filters: 32 -> 64 (match bigger backbone).
+
+CHANGES v7 (draw penalty + training throughput — resume from 122M checkpoint):
+- clip_eps: 0.10 -> 0.12 (clipfrac trop bas à 0.043, le modèle sous-apprend)
+- ppo_epochs: 2 -> 3 (clipfrac bas = signal qu'on peut se permettre plus de passes)
+- curriculum_max_steps_cap: 250 -> 180 (parties trop longues = draw via 50-move rule)
+- REWARD_WIN: 1.5 -> 2.0, REWARD_DRAW: -0.8 -> -1.3 (voir reward.py)
+
+CHANGES v6 (training stability fix — diagnosed from TensorBoard logs):
+- ROOT CAUSE FOUND: tanh on value head bounded predictions to [-1,1] but GAE returns
+  reach 5-15+. This caused value_loss=16-27, corrupted advantages, KL explosion (0.23),
+  and policy collapse from 85% win rate to 18% in one run.
+- value head tanh REMOVED in network.py (linear output now).
+- Return normalization added in ppo.py (targets normalized per-update batch).
+- clip_eps: 0.18 -> 0.10 (approx_kl was exploding to 0.23, needed tighter clip)
+- ppo_epochs: 4 -> 2 (fewer passes = less cumulative policy drift per rollout)
+- num_minibatches: 6 -> 8 (smaller minibatches = more gradient steps but each is smaller)
+- entropy_coef: 0.008 -> 0.015 (entropy died to 1.12 nats, need stronger push)
+- entropy_coef_min: 0.003 -> 0.008 (higher floor, never let entropy die again)
+- entropy_coef_decay_steps: 400M -> 800M (much slower decay)
+- value_coef: 0.25 -> 0.25 (unchanged; with normalized targets it's already appropriate)
+- REWARD: REWARD_CHECK_3RD_CAPTURE_PENALTY removed (was penalizing valid captures)
+- REWARD: outcome-based check escape reward added (see reward.py / chess_obscur_env.py)
+- REWARD: REWARD_PARRY_SELF_CAPTURE: -0.30 -> -0.80 (model was at 1.3% then regressed to 7%)
 """
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,14 +55,14 @@ class Config:
 
     # ── Environment ──
     num_envs: int = 2048         # parallel games on GPU (2048-4096 optimal on 5090)
-    max_game_steps: int = 150     # CHANGED: 120 -> 150 initial max steps
+    max_game_steps: int = 150     # initial max steps
 
     # ── Curriculum: progressive max_steps increase ──
     curriculum_enabled: bool = True
-    curriculum_start_steps: int = 150      # CHANGED: 120 -> 150
-    curriculum_step_increase: int = 10     # CHANGED: 15 -> 10 (slower increase)
+    curriculum_start_steps: int = 150
+    curriculum_step_increase: int = 10
     curriculum_every_n_timesteps: int = 5_000_000  # every 5M timesteps
-    curriculum_max_steps_cap: int = 250    # CHANGED: 300 -> 250 (KEY FIX: 300 was causing 75% draws)
+    curriculum_max_steps_cap: int = 180
 
     # ── Observation ──
     obs_planes: int = 19
@@ -55,37 +80,47 @@ class Config:
     ACTION_ATTEMPT_PARRY: int = 4161
     ACTION_ACCEPT_LOSS: int = 4162
 
-    # ── Network ──
-    num_res_blocks: int = 10
-    num_filters: int = 128
-    value_head_hidden: int = 512     # CHANGED: 256 -> 512, value loss exploded to 3.8
-    policy_head_filters: int = 32
+    # ── Network v8 ──
+    num_res_blocks: int = 15         # v8: 10 -> 15
+    num_filters: int = 192           # v8: 128 -> 192
+    value_head_hidden: int = 1024    # v8: 512 -> 1024
+    policy_head_filters: int = 64    # v8: 32 -> 64
 
     # ── PPO ──
     lr: float = 3e-4
+    lr_min: float = 3e-5            # v8: LR floor (never go to zero)
+    lr_warmup_steps: int = 1_000_000  # v8: linear warmup over first 1M steps
+    lr_restart_period: int = 100_000_000  # v8: cosine restart every 100M steps
+    lr_restart_decay: float = 0.5    # v8: each restart ceiling = prev * decay
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_eps: float = 0.18           # CHANGED: 0.15 -> 0.18, clipfrac was 0.07 = under-learning
-    clip_value: float = 0.0          # TO DO : Might get back to 0.5 or 1.5 if too much instability
-    entropy_coef: float = 0.008      # CHANGED: 0.005 -> 0.008, entropy died at 1.8
-    entropy_coef_min: float = 0.003   # CHANGED: 0.0015 -> 0.003, higher floor
-    entropy_coef_decay_steps: int = 400_000_000  # CHANGED: 200M -> 400M, MUCH slower
-    value_coef: float = 0.25          # CHANGED: 1.0 -> 0.5, stabilize value head
+    clip_eps: float = 0.12
+    clip_value: float = 1.0
+    entropy_coef: float = 0.015
+    entropy_coef_min: float = 0.008
+    entropy_coef_decay_steps: int = 800_000_000
+    value_coef: float = 0.25
     max_grad_norm: float = 0.5
-    ppo_epochs: int = 4              # CHANGED: 3 -> 4, more epochs with wider clip
-    num_minibatches: int = 6         # CHANGED: 8 -> 6, larger minibatches
+    ppo_epochs: int = 3
+    num_minibatches: int = 8
 
     # ── Rollout ──
     rollout_steps: int = 256         # steps per env before PPO update
     batch_size: int = -1             # computed = num_envs * rollout_steps
     minibatch_size: int = -1         # computed = batch_size / num_minibatches
-    microbatch_size: int = 8192      # larger for RTX 5090 (was 2048)
+    microbatch_size: int = 8192      # larger for RTX 5090
 
     # ── Training schedule ──
-    total_timesteps: int = 500_000_000  # very long — continuous training
+    total_timesteps: int = 500_000_000
     checkpoint_interval: int = 50_000
     log_interval: int = 1_000
     eval_games: int = 100
+
+    # ── League training v8 ──
+    league_enabled: bool = True
+    league_frac: float = 0.30         # 30% of envs play against past checkpoints
+    league_checkpoint_interval: int = 10_000_000  # snapshot every 10M steps
+    league_max_checkpoints: int = 10  # keep last N snapshots in the pool
 
     # ── Warmstart (behavioral cloning from website games) ──
     warmstart_file: Optional[str] = None
@@ -115,6 +150,27 @@ class Config:
             self.microbatch_size = min(2048, self.minibatch_size)
         else:
             self.microbatch_size = min(self.microbatch_size, self.minibatch_size)
+
+    def get_lr(self, global_step: int) -> float:
+        """Cosine annealing with warm restarts and decaying ceiling.
+
+        - Linear warmup for the first lr_warmup_steps.
+        - After warmup: cosine annealing from lr_max to lr_min over lr_restart_period.
+        - At each restart boundary, lr_max is multiplied by lr_restart_decay.
+        - Never goes below lr_min.
+        """
+        if global_step < self.lr_warmup_steps:
+            return self.lr_min + (self.lr - self.lr_min) * (global_step / self.lr_warmup_steps)
+
+        step = global_step - self.lr_warmup_steps
+        n_restarts = step // self.lr_restart_period
+        step_in_cycle = step % self.lr_restart_period
+        progress_in_cycle = step_in_cycle / self.lr_restart_period
+
+        lr_max = self.lr * (self.lr_restart_decay ** n_restarts)
+        lr_max = max(lr_max, self.lr_min)
+
+        return self.lr_min + 0.5 * (lr_max - self.lr_min) * (1 + math.cos(math.pi * progress_in_cycle))
 
     def get_entropy_coef(self, global_step: int) -> float:
         """Decay linéaire de l'entropy coef de entropy_coef vers entropy_coef_min."""

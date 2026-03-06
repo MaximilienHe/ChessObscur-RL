@@ -51,12 +51,13 @@ class PPOTrainer:
     def update(self, rollout: Dict[str, torch.Tensor], global_step: int = 0) -> Dict[str, float]:
         """
         PPO update.
-        
+
         CHANGED: accepts global_step to compute dynamic entropy_coef.
+        CHANGED v6: return normalization to stabilize value function (fixes tanh bottleneck).
         """
         cfg = self.cfg
 
-        # ── NEW: dynamic entropy coefficient decay ──
+        # ── dynamic entropy coefficient decay ──
         entropy_coef = cfg.get_entropy_coef(global_step)
         self._current_entropy_coef = entropy_coef
 
@@ -84,6 +85,17 @@ class PPOTrainer:
         b_legal_masks = rollout["legal_masks"].reshape(B, -1)
 
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+
+        # ── Return normalization (v6 fix) ──
+        # The value head is now linear (no tanh), so it can predict returns of any
+        # magnitude. Normalizing targets keeps gradients stable regardless of the
+        # reward scale or game length. Old values are normalized consistently so
+        # the clipped value loss remains valid.
+        with torch.no_grad():
+            returns_mean = b_returns.mean()
+            returns_std = b_returns.std() + 1e-8
+            b_returns_norm = (b_returns - returns_mean) / returns_std
+            b_values_norm = (b_values - returns_mean) / returns_std
 
         total_pg_loss = 0.0
         total_v_loss = 0.0
@@ -121,8 +133,8 @@ class PPOTrainer:
                             mb_actions = b_actions[micro_idx]
                             mb_old_log_probs = b_log_probs[micro_idx]
                             mb_advantages = b_advantages[micro_idx]
-                            mb_returns = b_returns[micro_idx]
-                            mb_old_values = b_values[micro_idx]
+                            mb_returns_norm = b_returns_norm[micro_idx]   # normalized
+                            mb_old_values_norm = b_values_norm[micro_idx] # normalized
                             mb_legal = b_legal_masks[micro_idx]
 
                             # Mixed precision forward pass
@@ -140,15 +152,18 @@ class PPOTrainer:
                                 )
                                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
+                                # Value loss uses normalized targets so the linear
+                                # head always receives well-scaled gradients.
                                 if cfg.clip_value > 0:
-                                    v_clipped = mb_old_values + torch.clamp(
-                                        new_values - mb_old_values, -cfg.clip_value, cfg.clip_value
+                                    v_clipped = mb_old_values_norm + torch.clamp(
+                                        new_values - mb_old_values_norm,
+                                        -cfg.clip_value, cfg.clip_value
                                     )
-                                    v_loss1 = (new_values - mb_returns) ** 2
-                                    v_loss2 = (v_clipped - mb_returns) ** 2
+                                    v_loss1 = (new_values - mb_returns_norm) ** 2
+                                    v_loss2 = (v_clipped - mb_returns_norm) ** 2
                                     v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
                                 else:
-                                    v_loss = 0.5 * ((new_values - mb_returns) ** 2).mean()
+                                    v_loss = 0.5 * ((new_values - mb_returns_norm) ** 2).mean()
 
                                 entropy_loss = entropy.mean()
 
@@ -200,12 +215,20 @@ class PPOTrainer:
             "loss/entropy": total_entropy / max(n_updates, 1),
             "ppo/clipfrac": total_clipfrac / max(n_updates, 1),
             "ppo/approx_kl": total_approx_kl / max(n_updates, 1),
-            "ppo/entropy_coef": entropy_coef,  # NEW: log current entropy coef
+            "ppo/entropy_coef": entropy_coef,
+            # Return normalization diagnostics (v6): monitor scale of raw returns
+            "returns/mean": returns_mean.item(),
+            "returns/std": returns_std.item(),
         }
 
         return metrics
 
-    def update_lr(self, progress: float):
-        lr = self.cfg.lr * (1.0 - progress)
+    def update_lr(self, progress: float, global_step: int = 0):
+        """Update learning rate using cosine annealing with warm restarts (v8).
+
+        The progress parameter is kept for API compat but global_step is used
+        for the actual schedule via cfg.get_lr().
+        """
+        lr = self.cfg.get_lr(global_step)
         for pg in self.optimizer.param_groups:
             pg["lr"] = lr

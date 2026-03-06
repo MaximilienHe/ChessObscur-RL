@@ -1,7 +1,12 @@
 """
 train.py — Main continuous training loop for Chess Obscur PPO.
 
-CHANGES:
+CHANGES v8:
+- League training: 30% of envs play against past checkpoints
+- Cosine annealing LR with warm restarts (via cfg.get_lr)
+- Log league stats to TensorBoard
+
+CHANGES v7:
 - Pass global_step to ppo.update() for entropy decay
 - Cap curriculum at curriculum_max_steps_cap
 - Log per-color rewards and entropy_coef to TensorBoard
@@ -21,8 +26,9 @@ from env.chess_obscur_env import ChessObscurEnv
 from model.network import ChessObscurNetwork
 from model.ppo import PPOTrainer
 from training.self_play import RolloutBuffer, collect_rollout
+from training.league import LeaguePool
 from utils.checkpoint import (
-    save_checkpoint, load_checkpoint, find_latest_checkpoint, checkpoint_path
+    save_checkpoint, load_checkpoint, checkpoint_path, list_checkpoints
 )
 from utils.logger import Logger
 
@@ -165,6 +171,10 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
     print(f"  Max game steps: {cfg.max_game_steps}")
     print(f"  Curriculum cap: {cfg.curriculum_max_steps_cap}")
     print(f"  Entropy coef: {cfg.entropy_coef} → {cfg.entropy_coef_min} over {cfg.entropy_coef_decay_steps:,} steps")
+    print(f"  LR schedule: cosine annealing, lr={cfg.lr} → lr_min={cfg.lr_min}, "
+          f"restart every {cfg.lr_restart_period:,} steps (decay={cfg.lr_restart_decay})")
+    print(f"  League: {'ON' if cfg.league_enabled else 'OFF'}"
+          f"{f' ({cfg.league_frac*100:.0f}% envs, snapshot every {cfg.league_checkpoint_interval:,} steps)' if cfg.league_enabled else ''}")
     print(f"  Total steps: {cfg.total_timesteps:,}")
     print(f"{'='*60}\n")
 
@@ -186,19 +196,30 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
 
     if resume:
         if resume == "latest":
-            ckpt_path = find_latest_checkpoint(cfg.checkpoint_dir)
+            ckpt_candidates = list_checkpoints(cfg.checkpoint_dir, descending=True)
         else:
-            ckpt_path = resume
+            ckpt_candidates = [resume]
 
-        if ckpt_path and os.path.exists(ckpt_path):
+        if not ckpt_candidates:
+            print(f"[resume] No checkpoint found at '{resume}', starting fresh")
+        else:
             # Create temporary optimizer just for loading state
             temp_optimizer = torch.optim.Adam(network.parameters(), lr=cfg.lr, eps=1e-5)
-            ckpt_data = load_checkpoint(ckpt_path, network, temp_optimizer, device)
-            global_step = ckpt_data.get("global_step", 0)
-            optimizer_state = temp_optimizer.state_dict()
-            print(f"[resume] Resuming from step {global_step}")
-        else:
-            print(f"[resume] No checkpoint found at '{resume}', starting fresh")
+            for ckpt_path in ckpt_candidates:
+                if not os.path.exists(ckpt_path):
+                    continue
+                try:
+                    ckpt_data = load_checkpoint(ckpt_path, network, temp_optimizer, device)
+                    global_step = ckpt_data.get("global_step", 0)
+                    optimizer_state = temp_optimizer.state_dict()
+                    print(f"[resume] Resuming from step {global_step}")
+                    break
+                except Exception as exc:
+                    print(f"[resume] Failed to load checkpoint '{ckpt_path}': {exc}")
+                    if resume != "latest":
+                        break
+            if optimizer_state is None:
+                print(f"[resume] No valid checkpoint found for '{resume}', starting fresh")
 
     # Apply torch.compile() AFTER loading checkpoint
     if cfg.use_compile and device == "cuda":
@@ -228,6 +249,17 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
 
     logger = Logger(log_dir=cfg.log_dir)
 
+    # ── v8: League training setup ──
+    league = LeaguePool(cfg) if cfg.league_enabled else None
+    league_mask = None
+    opponent_net = None
+    if league is not None:
+        n_league = int(cfg.num_envs * cfg.league_frac)
+        league_mask = torch.zeros(cfg.num_envs, dtype=torch.bool, device=device)
+        league_mask[:n_league] = True
+        print(f"[league] Enabled: {n_league}/{cfg.num_envs} envs ({cfg.league_frac*100:.0f}%) "
+              f"play against past checkpoints")
+
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     num_updates = cfg.total_timesteps // cfg.batch_size
     total_games = 0
@@ -241,18 +273,29 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
             update_start = time.time()
 
             progress = global_step / cfg.total_timesteps
-            ppo.update_lr(progress)
+            ppo.update_lr(progress, global_step=global_step)
 
-            obs, rollout_stats = collect_rollout(env, network, buffer, obs, use_amp=cfg.use_amp)
+            # ── v8: League — snapshot & pick opponent ──
+            if league is not None:
+                league.maybe_snapshot(network, global_step)
+                if league.has_opponents():
+                    opponent_net = league.get_random_opponent()
+                else:
+                    opponent_net = None
+
+            obs, rollout_stats = collect_rollout(
+                env, network, buffer, obs, use_amp=cfg.use_amp,
+                opponent_net=opponent_net,
+                league_mask=league_mask if opponent_net is not None else None,
+            )
             rollout_data = buffer.get(next_obs=obs)
 
-            # ── CHANGED: pass global_step for entropy decay ──
             ppo_metrics = ppo.update(rollout_data, global_step=global_step)
 
             global_step += cfg.batch_size
             total_games += int(rollout_stats.get("rollout/games_completed", 0))
 
-            # ── CHANGED: curriculum with cap ──
+            # ── Curriculum with cap ──
             if cfg.curriculum_enabled:
                 raw_max_steps = cfg.curriculum_start_steps + \
                     (global_step // cfg.curriculum_every_n_timesteps) * cfg.curriculum_step_increase
@@ -266,6 +309,10 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
             all_metrics["train/total_games"] = total_games
             all_metrics["train/lr"] = ppo.optimizer.param_groups[0]["lr"]
             all_metrics["train/max_steps"] = env.max_steps
+
+            # v8: league pool size
+            if league is not None:
+                all_metrics["league/pool_size"] = league.pool_size
 
             update_time = time.time() - update_start
             fps = cfg.batch_size / max(update_time, 1e-6)
@@ -326,6 +373,10 @@ def parse_args():
     parser.add_argument("--compile-mode", type=str, default=None,
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile() mode")
+    # v8: league training
+    parser.add_argument("--no-league", action="store_true", help="Disable league training")
+    parser.add_argument("--league-frac", type=float, default=None,
+                        help="Fraction of envs playing against past checkpoints (default: 0.30)")
     return parser.parse_args()
 
 
@@ -348,6 +399,9 @@ def main():
     if args.no_compile: cfg.use_compile = False
     if args.no_amp: cfg.use_amp = False
     if args.compile_mode is not None: cfg.compile_mode = args.compile_mode
+    # v8: league flags
+    if args.no_league: cfg.league_enabled = False
+    if args.league_frac is not None: cfg.league_frac = args.league_frac
 
     cfg.__post_init__()
 
@@ -365,16 +419,34 @@ def main():
             obs_planes=cfg.obs_planes,
             num_filters=cfg.num_filters,
             num_res_blocks=cfg.num_res_blocks,
+            policy_head_filters=cfg.policy_head_filters,
+            value_head_hidden=cfg.value_head_hidden,
             total_actions=cfg.total_actions,
         ).to(cfg.device)
 
         ckpt = args.checkpoint or args.resume
         if ckpt == "latest":
-            ckpt = find_latest_checkpoint(cfg.checkpoint_dir)
-        if ckpt and os.path.exists(ckpt):
-            load_checkpoint(ckpt, network, device=cfg.device)
+            ckpt_candidates = list_checkpoints(cfg.checkpoint_dir, descending=True)
+        elif ckpt:
+            ckpt_candidates = [ckpt]
         else:
-            print("[eval] No checkpoint specified, evaluating random network")
+            ckpt_candidates = []
+
+        loaded = False
+        for ckpt_path in ckpt_candidates:
+            if not os.path.exists(ckpt_path):
+                continue
+            try:
+                load_checkpoint(ckpt_path, network, device=cfg.device)
+                loaded = True
+                break
+            except Exception as exc:
+                print(f"[eval] Failed to load checkpoint '{ckpt_path}': {exc}")
+                if ckpt != "latest":
+                    break
+
+        if not loaded:
+            print("[eval] No valid checkpoint specified, evaluating random network")
 
         evaluate(network, cfg, num_games=cfg.eval_games)
         return

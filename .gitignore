@@ -77,3 +77,5 @@ dmypy.json
 *.prof
 
 ChessObscur-Web/
+
+runs*/

@@ -1,14 +1,18 @@
 """
 self_play.py — Self-play rollout collection.
 
+CHANGES v8:
+- League training support: some envs play against past checkpoints.
+  When it's the opponent's turn in a league env, the opponent network picks
+  the action. The learning network still evaluates all states for PPO.
+
 CHANGES v5:
 - Removed all parry/enemy_capture stats (illegal move removed)
 - Parry stats now track only 3 outcomes: skip, good_move, self_capture
-- Removed parry diagnostic counters (could_move, could_enemy_capture, skip_when_*)
 """
 import torch
 import time
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 from env.chess_obscur_env import ChessObscurEnv
 from model.network import ChessObscurNetwork
@@ -60,9 +64,18 @@ class RolloutBuffer:
 
 def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
                     buffer: RolloutBuffer, obs: torch.Tensor,
-                    use_amp: bool = False) -> Tuple[torch.Tensor, Dict]:
+                    use_amp: bool = False,
+                    opponent_net: Optional[ChessObscurNetwork] = None,
+                    league_mask: Optional[torch.Tensor] = None,
+                    ) -> Tuple[torch.Tensor, Dict]:
     """
     Collect T steps of self-play experience.
+
+    v8 league training: if opponent_net and league_mask are provided,
+    envs where league_mask=True will use opponent_net when it's the
+    opponent's turn. The learning network still evaluates all states
+    for PPO (log_probs and values always come from the main network).
+
     Returns: (next_obs, stats_dict)
     """
     T = buffer.T
@@ -83,6 +96,13 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
     total_legal_actions = 0
     game_lengths = []
 
+    # v8: league win tracking
+    league_games = 0
+    league_wins = 0
+
+    use_league = (opponent_net is not None and league_mask is not None
+                  and league_mask.any())
+
     network.eval()
     with torch.no_grad():
         for t in range(T):
@@ -97,8 +117,30 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
             if no_legal.any():
                 legal_mask[no_legal, 4162] = True
 
+            # Main network evaluates ALL envs (for PPO log_probs and values)
             with torch.amp.autocast('cuda', enabled=use_amp):
                 action, log_prob, entropy, value = network.get_action_and_value(obs, legal_mask)
+
+            # v8 league: override actions for league envs when it's the opponent's turn
+            if use_league:
+                # Opponent's turn = when current active player is NOT the agent
+                is_opponent_turn = env.turn_is_white != env.agent_is_white
+                opp_envs = league_mask & is_opponent_turn
+
+                if opp_envs.any():
+                    opp_idx = opp_envs.nonzero(as_tuple=True)[0]
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        opp_action, _, _, _ = opponent_net.get_action_and_value(
+                            obs[opp_idx], legal_mask[opp_idx]
+                        )
+                    action[opp_idx] = opp_action
+                    # Re-evaluate log_prob for the opponent-chosen action from
+                    # the main network's perspective (needed for correct PPO ratio)
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        _, log_prob_reeval, _, _ = network.get_action_and_value(
+                            obs[opp_idx], legal_mask[opp_idx], opp_action
+                        )
+                    log_prob[opp_idx] = log_prob_reeval
 
             next_obs, reward, done, info = env.step(action)
 
@@ -124,6 +166,17 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
                 move_counts = info["full_move_count"][done]
                 for mc in move_counts:
                     game_lengths.append(mc.item())
+
+                # v8: track league-specific win rate
+                if use_league:
+                    done_league = done & league_mask
+                    if done_league.any():
+                        league_games += done_league.sum().item()
+                        league_results = info["result"][done_league]
+                        league_agent_white = env.agent_is_white[done_league]
+                        agent_wins = ((league_results == 1) & league_agent_white) | \
+                                     ((league_results == 2) & ~league_agent_white)
+                        league_wins += agent_wins.sum().item()
 
             total_rewards += reward.sum().item()
             obs = next_obs
@@ -154,6 +207,12 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
         stats["game/avg_length"] = sum(game_lengths) / len(game_lengths)
         stats["game/max_length"] = max(game_lengths)
         stats["game/min_length"] = min(game_lengths)
+
+    # v8: league stats
+    if league_games > 0:
+        stats["league/games"] = league_games
+        stats["league/win_rate"] = league_wins / league_games
+        stats["league/pool_size"] = 0  # filled in by train.py
 
     # ── Parry stats: 3 outcomes only (skip, good_move, self_capture) ──
     parry_stats = env.get_and_reset_parry_stats()
