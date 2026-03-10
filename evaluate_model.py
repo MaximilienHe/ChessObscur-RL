@@ -17,8 +17,20 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config
-from env.chess_obscur_env import ChessObscurEnv, PHASE_MOVE, PHASE_DEFENSE, PHASE_PARRY, PHASE_FINISHED
-from env.chess_obscur_env import RESULT_ONGOING, RESULT_WHITE_WIN, RESULT_BLACK_WIN, RESULT_DRAW
+from env.chess_obscur_env import (
+    ChessObscurEnv,
+    PHASE_MOVE,
+    PHASE_DEFENSE,
+    PHASE_PARRY,
+    PHASE_FINISHED,
+    RESULT_ONGOING,
+    RESULT_WHITE_WIN,
+    RESULT_BLACK_WIN,
+    RESULT_DRAW,
+    ACTION_ATTEMPT_BLOCK,
+    ACTION_ATTEMPT_PARRY,
+    ACTION_ACCEPT_LOSS,
+)
 from model.network import ChessObscurNetwork
 from utils.checkpoint import load_checkpoint, find_latest_checkpoint
 
@@ -33,20 +45,10 @@ def load_model(checkpoint_path, cfg, device):
         value_head_hidden=cfg.value_head_hidden,
         total_actions=cfg.total_actions,
     ).to(device)
-    
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith("_orig_mod."):
-            new_state_dict[key.replace("_orig_mod.", "")] = value
-        else:
-            new_state_dict[key] = value
-    
-    network.load_state_dict(new_state_dict)
+
+    ckpt = load_checkpoint(checkpoint_path, network, device=device)
     network.eval()
-    
+
     step = ckpt.get("global_step", 0) if isinstance(ckpt, dict) else 0
     print(f"  Loaded: {checkpoint_path} (step {step:,})")
     return network, step
@@ -94,7 +96,7 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
             
             no_legal = ~legal_mask.any(dim=1)
             if no_legal.any():
-                legal_mask[no_legal, 4162] = True
+                legal_mask[no_legal, ACTION_ACCEPT_LOSS] = True
             
             policy_logits, value = network(obs, legal_mask)
             
@@ -111,9 +113,9 @@ def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
             if in_def.any():
                 def_actions = actions[in_def]
                 stats["defense_total"] += def_actions.shape[0]
-                stats["defense_block"] += (def_actions == 4160).sum().item()
-                stats["defense_parry"] += (def_actions == 4161).sum().item()
-                stats["defense_accept"] += (def_actions == 4162).sum().item()
+                stats["defense_block"] += (def_actions == ACTION_ATTEMPT_BLOCK).sum().item()
+                stats["defense_parry"] += (def_actions == ACTION_ATTEMPT_PARRY).sum().item()
+                stats["defense_accept"] += (def_actions == ACTION_ACCEPT_LOSS).sum().item()
             
             # Track parry decisions (3 outcomes)
             in_parry = env.phase == PHASE_PARRY

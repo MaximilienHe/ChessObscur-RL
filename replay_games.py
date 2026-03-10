@@ -11,9 +11,15 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config
-from env.chess_obscur_env import ChessObscurEnv, PHASE_MOVE, PHASE_DEFENSE, PHASE_PARRY
+from env.chess_obscur_env import (
+    ChessObscurEnv,
+    PHASE_MOVE,
+    PHASE_DEFENSE,
+    PHASE_PARRY,
+    ACTION_ACCEPT_LOSS,
+)
 from model.network import ChessObscurNetwork
-from utils.checkpoint import find_latest_checkpoint
+from utils.checkpoint import find_latest_checkpoint, load_checkpoint
 
 
 # Piece symbols for display
@@ -94,19 +100,7 @@ def load_model(checkpoint_path, cfg, device):
         value_head_hidden=cfg.value_head_hidden,
         total_actions=cfg.total_actions,
     ).to(device)
-
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = ckpt.get("model_state_dict", ckpt)
-
-    # Strip _orig_mod prefix if present
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith("_orig_mod."):
-            new_state_dict[key.replace("_orig_mod.", "")] = value
-        else:
-            new_state_dict[key] = value
-
-    network.load_state_dict(new_state_dict)
+    load_checkpoint(checkpoint_path, network, device=device)
     network.eval()
 
     return network
@@ -135,7 +129,7 @@ def record_games(network, cfg, num_games=100, device="cuda"):
             legal_mask = env.get_legal_mask()
             no_legal = ~legal_mask.any(dim=1)
             if no_legal.any():
-                legal_mask[no_legal, 4162] = True
+                legal_mask[no_legal, ACTION_ACCEPT_LOSS] = True
 
             policy_logits, value = network(obs, legal_mask)
             actions = policy_logits.argmax(dim=-1)

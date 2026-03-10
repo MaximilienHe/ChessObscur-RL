@@ -25,6 +25,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model.network import ChessObscurNetwork
 from config import Config
+from env.chess_obscur_env import (
+    ACTION_ATTEMPT_BLOCK,
+    ACTION_ATTEMPT_PARRY,
+    ACTION_ACCEPT_LOSS,
+)
+from utils.checkpoint import prepare_model_state_dict
+
+TOTAL_ACTIONS = ACTION_ACCEPT_LOSS + 1
 
 # ─────────────────────────────────────────────
 #  Pydantic models pour l'API
@@ -240,16 +248,16 @@ def build_obs_from_request(req: MoveRequest) -> torch.Tensor:
 
 def build_legal_mask_from_request(req: MoveRequest) -> torch.Tensor:
     """
-    Construit le masque d'actions légales (1, 4163) à partir des coups
+    Construit le masque d'actions légales (1, 4099) à partir des coups
     légaux envoyés par le serveur Node.js.
     """
-    mask = torch.zeros(1, 4163, dtype=torch.bool)
+    mask = torch.zeros(1, TOTAL_ACTIONS, dtype=torch.bool)
 
     if req.phase == "defense":
         # En défense : 3 actions possibles
-        mask[0, 4160] = True  # ATTEMPT_BLOCK
-        mask[0, 4161] = True  # ATTEMPT_PARRY
-        mask[0, 4162] = True  # ACCEPT_LOSS
+        mask[0, ACTION_ATTEMPT_BLOCK] = True
+        mask[0, ACTION_ATTEMPT_PARRY] = True
+        mask[0, ACTION_ACCEPT_LOSS] = True
         return mask
 
     # Phase move ou parry_move : utiliser les coups légaux
@@ -268,7 +276,7 @@ def build_legal_mask_from_request(req: MoveRequest) -> torch.Tensor:
 
     # S'assurer qu'au moins une action est légale
     if not mask.any():
-        mask[0, 4162] = True  # fallback
+        mask[0, ACTION_ACCEPT_LOSS] = True
 
     return mask
 
@@ -292,25 +300,25 @@ def compute_stop_ms_for_zone(action: int, zones: Optional[QteZones], duration_ms
     
     Si les zones ne sont pas fournies, utilise un fallback raisonnable.
     """
-    if action == 4162:
+    if action == ACTION_ACCEPT_LOSS:
         # ACCEPT_LOSS — pas de stopMs
         return None
 
     if zones is not None:
-        if action == 4160:
+        if action == ACTION_ATTEMPT_BLOCK:
             # ATTEMPT_BLOCK → milieu de la zone de blocage
             mid = (zones.blockStartMs + zones.blockEndMs) // 2
             return max(0, min(duration_ms, mid))
-        elif action == 4161:
+        elif action == ACTION_ATTEMPT_PARRY:
             # ATTEMPT_PARRY → milieu de la zone de parade
             mid = (zones.parryStartMs + zones.parryEndMs) // 2
             return max(0, min(duration_ms, mid))
 
     # Fallback: pas de zones fournies, placer à 80% / 95% de la durée
     # C'est moins fiable mais mieux que des valeurs fixes
-    if action == 4160:
+    if action == ACTION_ATTEMPT_BLOCK:
         return int(duration_ms * 0.80)
-    elif action == 4161:
+    elif action == ACTION_ATTEMPT_PARRY:
         return int(duration_ms * 0.95)
 
     return None
@@ -324,17 +332,6 @@ app = FastAPI(title="Chess Obscur AI")
 model: ChessObscurNetwork = None
 device: torch.device = None
 temperature: float = 0.5
-
-
-def _strip_compile_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Remove _orig_mod. prefix added by torch.compile checkpoints."""
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith("_orig_mod."):
-            new_state_dict[key.replace("_orig_mod.", "", 1)] = value
-        else:
-            new_state_dict[key] = value
-    return new_state_dict
 
 
 def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor], cfg: Config) -> None:
@@ -374,15 +371,7 @@ def load_model(checkpoint_path: str, dev: str = "cpu",
     global model, device
     device = torch.device(dev)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Extract state dict
-    if "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    else:
-        state_dict = ckpt
-
-    # Remove _orig_mod. prefix if present (from torch.compile)
-    new_state_dict = _strip_compile_prefix(state_dict)
+    new_state_dict, migrated = prepare_model_state_dict(ckpt)
 
     cfg = Config()
     _infer_arch_from_state_dict(new_state_dict, cfg)
@@ -409,6 +398,8 @@ def load_model(checkpoint_path: str, dev: str = "cpu",
     model.load_state_dict(new_state_dict)
     model.eval()
     print(f"[ai] Modèle chargé: {checkpoint_path} sur {device}")
+    if migrated:
+        print("[ai] Checkpoint legacy adapte automatiquement de 4163 a 4099 actions")
     print(
         f"[ai] Arch: num_filters={cfg.num_filters}, num_res_blocks={cfg.num_res_blocks}, "
         f"policy_head_filters={cfg.policy_head_filters}, value_head_hidden={cfg.value_head_hidden}"
@@ -462,14 +453,14 @@ def _decode_defense_action(action: int, zones: Optional[QteZones] = None,
     """
     stop_ms = compute_stop_ms_for_zone(action, zones, duration_ms)
 
-    if action == 4160:
+    if action == ACTION_ATTEMPT_BLOCK:
         # ATTEMPT_BLOCK
         return MoveResponse(
             action="defense",
             defenseAction="stop",
             stopMs=stop_ms,
         )
-    elif action == 4161:
+    elif action == ACTION_ATTEMPT_PARRY:
         # ATTEMPT_PARRY
         return MoveResponse(
             action="defense",

@@ -13,6 +13,11 @@ import argparse
 import torch
 from typing import List, Dict, Tuple, Optional
 
+from env.chess_obscur_env import (
+    ACTION_ACCEPT_LOSS,
+    ACTION_ATTEMPT_BLOCK,
+    ACTION_ATTEMPT_PARRY,
+)
 from env.move_tables import (
     W_PAWN, W_KNIGHT, W_BISHOP, W_ROOK, W_QUEEN, W_KING,
     B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
@@ -120,12 +125,12 @@ def move_to_action(move: dict) -> Optional[int]:
     if move_type == "DEFENSE_RESOLVE":
         attempt = move.get("attempt", "")
         if attempt == "BLOCAGE":
-            return 4160  # ATTEMPT_BLOCK
+            return ACTION_ATTEMPT_BLOCK
         elif attempt == "PARADE":
-            return 4161  # ATTEMPT_PARRY
+            return ACTION_ATTEMPT_PARRY
         elif attempt in ("ACCEPT_LOSS", "PASSE", "ECHEC_ZONE"):
-            return 4162  # ACCEPT_LOSS
-        return 4162  # default
+            return ACTION_ACCEPT_LOSS
+        return ACTION_ACCEPT_LOSS
 
     return None
 
