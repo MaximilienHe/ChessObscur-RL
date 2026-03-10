@@ -122,7 +122,7 @@ def evaluate(network: ChessObscurNetwork, cfg: Config, num_games: int = 100):
             legal_mask = env.get_legal_mask()
             no_legal = ~legal_mask.any(dim=1)
             if no_legal.any():
-                legal_mask[no_legal, 4162] = True
+                legal_mask[no_legal, cfg.ACTION_ACCEPT_LOSS] = True
 
             policy_logits, value = network(obs, legal_mask)
             actions = policy_logits.argmax(dim=-1)
@@ -193,6 +193,7 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
     # Load checkpoint BEFORE compiling (to avoid _orig_mod prefix mismatch)
     global_step = 0
     optimizer_state = None
+    optimizer_state_loaded = False
 
     if resume:
         if resume == "latest":
@@ -211,7 +212,9 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
                 try:
                     ckpt_data = load_checkpoint(ckpt_path, network, temp_optimizer, device)
                     global_step = ckpt_data.get("global_step", 0)
-                    optimizer_state = temp_optimizer.state_dict()
+                    optimizer_state_loaded = ckpt_data.get("_optimizer_state_loaded", False)
+                    if optimizer_state_loaded:
+                        optimizer_state = temp_optimizer.state_dict()
                     print(f"[resume] Resuming from step {global_step}")
                     break
                 except Exception as exc:
@@ -234,6 +237,8 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
     if optimizer_state is not None:
         ppo.optimizer.load_state_dict(optimizer_state)
         print(f"[resume] Optimizer state restored")
+    elif resume and optimizer_state_loaded is False:
+        print("[resume] Optimizer state not restored")
 
     if warmstart and os.path.exists(warmstart):
         warmstart_from_human_data(network, warmstart, cfg)

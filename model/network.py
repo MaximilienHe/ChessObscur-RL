@@ -25,7 +25,7 @@ class ResBlock(nn.Module):
 class ChessObscurNetwork(nn.Module):
     def __init__(self, obs_planes: int = 19, num_filters: int = 128,
                  num_res_blocks: int = 10, policy_head_filters: int = 32,
-                 value_head_hidden: int = 256, total_actions: int = 4163):
+                 value_head_hidden: int = 256, total_actions: int = 4099):
         super().__init__()
 
         self.input_conv = nn.Sequential(

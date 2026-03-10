@@ -70,15 +70,14 @@ class Config:
 
     # ── Action space ──
     num_board_actions: int = 4096   # 64*64 from-to
-    num_promo_actions: int = 64     # underpromotion slots
     num_defense_actions: int = 3    # block, parry, accept_loss
-    total_actions: int = 4163       # 4096 + 64 + 3
+    total_actions: int = 4099       # 4096 + 3
 
     # ── Defense action indices ──
-    defense_offset: int = 4160      # 4096 + 64
-    ACTION_ATTEMPT_BLOCK: int = 4160
-    ACTION_ATTEMPT_PARRY: int = 4161
-    ACTION_ACCEPT_LOSS: int = 4162
+    defense_offset: int = 4096      # immediately after board actions
+    ACTION_ATTEMPT_BLOCK: int = 4096
+    ACTION_ATTEMPT_PARRY: int = 4097
+    ACTION_ACCEPT_LOSS: int = 4098
 
     # ── Network v8 ──
     num_res_blocks: int = 15         # v8: 10 -> 15

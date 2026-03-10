@@ -14,9 +14,10 @@ import torch
 import time
 from typing import Dict, Tuple, Optional
 
-from env.chess_obscur_env import ChessObscurEnv
+from env.chess_obscur_env import ChessObscurEnv, ACTION_ACCEPT_LOSS
 from model.network import ChessObscurNetwork
 from config import Config
+from utils.bitpack import pack_action_mask, packed_num_bytes
 
 
 class RolloutBuffer:
@@ -25,6 +26,8 @@ class RolloutBuffer:
     def __init__(self, T: int, N: int, obs_shape: Tuple, num_actions: int, device: str):
         self.T = T
         self.N = N
+        self.num_actions = num_actions
+        self.packed_mask_bytes = packed_num_bytes(num_actions)
         self.device = torch.device(device)
 
         self.obs = torch.zeros(T, N, *obs_shape, device=self.device)
@@ -33,7 +36,9 @@ class RolloutBuffer:
         self.rewards = torch.zeros(T, N, device=self.device)
         self.dones = torch.zeros(T, N, dtype=torch.bool, device=self.device)
         self.values = torch.zeros(T, N, device=self.device)
-        self.legal_masks = torch.zeros(T, N, num_actions, dtype=torch.bool, device=self.device)
+        self.legal_masks_packed = torch.zeros(
+            T, N, self.packed_mask_bytes, dtype=torch.uint8, device=self.device
+        )
 
         self.step = 0
 
@@ -45,7 +50,7 @@ class RolloutBuffer:
         self.rewards[t] = rewards
         self.dones[t] = dones
         self.values[t] = values
-        self.legal_masks[t] = legal_masks
+        self.legal_masks_packed[t] = pack_action_mask(legal_masks)
         self.step += 1
 
     def get(self, next_obs: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -57,7 +62,7 @@ class RolloutBuffer:
             "rewards": self.rewards,
             "dones": self.dones,
             "values": self.values,
-            "legal_masks": self.legal_masks,
+            "legal_masks_packed": self.legal_masks_packed,
             "next_obs": next_obs,
         }
 
@@ -115,7 +120,7 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
 
             no_legal = ~legal_mask.any(dim=1)
             if no_legal.any():
-                legal_mask[no_legal, 4162] = True
+                legal_mask[no_legal, ACTION_ACCEPT_LOSS] = True
 
             # Main network evaluates ALL envs (for PPO log_probs and values)
             with torch.amp.autocast('cuda', enabled=use_amp):

@@ -7,6 +7,7 @@ import torch.optim as optim
 from typing import Dict, Tuple
 
 from config import Config
+from utils.bitpack import unpack_action_mask
 
 
 class PPOTrainer:
@@ -82,7 +83,7 @@ class PPOTrainer:
         b_advantages = advantages.reshape(B)
         b_returns = returns.reshape(B)
         b_values = rollout["values"].reshape(B)
-        b_legal_masks = rollout["legal_masks"].reshape(B, -1)
+        b_legal_masks_packed = rollout["legal_masks_packed"].reshape(B, -1)
 
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
@@ -135,7 +136,9 @@ class PPOTrainer:
                             mb_advantages = b_advantages[micro_idx]
                             mb_returns_norm = b_returns_norm[micro_idx]   # normalized
                             mb_old_values_norm = b_values_norm[micro_idx] # normalized
-                            mb_legal = b_legal_masks[micro_idx]
+                            mb_legal = unpack_action_mask(
+                                b_legal_masks_packed[micro_idx], cfg.total_actions
+                            )
 
                             # Mixed precision forward pass
                             with torch.amp.autocast('cuda', enabled=self.use_amp):

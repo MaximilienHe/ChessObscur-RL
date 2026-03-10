@@ -25,15 +25,16 @@ import torch
 from env.move_tables import EMPTY
 
 
-# ── Terminal rewards ──
-REWARD_WIN = 2.0
-REWARD_LOSE = -1.0
+# ── Terminal rewards (v9: symmetric win/loss, draws never worse than loss) ──
+REWARD_WIN = 1.5
+REWARD_LOSE = -1.5
 
-# ── Progressive draw penalty v8 ──
-# Instead of a flat REWARD_DRAW, the penalty scales with game duration.
-# Early draws (stalemate, repetition) are less punished than late timeout draws.
-REWARD_DRAW_EARLY = -0.5       # v8: draw before 30% of max_steps
-REWARD_DRAW_LATE = -2.0        # v8: draw at/near timeout
+# ── Progressive draw penalty v9 ──
+# Symmetric win/loss ensures zero-sum self-play. Draws are always better than
+# losing (-1.5), preventing the contradictory incentive where a late draw was
+# punished harder than a loss (old: -2.0 draw vs -1.0 loss).
+REWARD_DRAW_EARLY = -0.3       # v9: stalemate / early repetition
+REWARD_DRAW_LATE = -1.0        # v9: timeout / 50-move (always < |REWARD_LOSE|)
 MATERIAL_SCALE = 0.15
 
 # ── Intermediate shaping ──
