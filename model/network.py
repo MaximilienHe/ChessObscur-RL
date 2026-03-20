@@ -45,13 +45,14 @@ class ChessObscurNetwork(nn.Module):
         )
         self.policy_fc = nn.Linear(policy_head_filters * 8 * 8, total_actions)
 
+        # v10: 1→4 channels to preserve spatial information
         self.value_conv = nn.Sequential(
-            nn.Conv2d(num_filters, 1, 1, bias=False),
-            nn.BatchNorm2d(1),
+            nn.Conv2d(num_filters, 4, 1, bias=False),
+            nn.BatchNorm2d(4),
             nn.ReLU(),
         )
         self.value_fc = nn.Sequential(
-            nn.Linear(1 * 8 * 8, value_head_hidden),
+            nn.Linear(4 * 8 * 8, value_head_hidden),
             nn.ReLU(),
             nn.Linear(value_head_hidden, 1),
             # No Tanh: returns can exceed [-1,1] with intermediate rewards accumulated

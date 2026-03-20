@@ -371,7 +371,7 @@ def load_model(checkpoint_path: str, dev: str = "cpu",
     global model, device
     device = torch.device(dev)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    new_state_dict, migrated = prepare_model_state_dict(ckpt)
+    new_state_dict, _, migration = prepare_model_state_dict(ckpt)
 
     cfg = Config()
     _infer_arch_from_state_dict(new_state_dict, cfg)
@@ -398,8 +398,10 @@ def load_model(checkpoint_path: str, dev: str = "cpu",
     model.load_state_dict(new_state_dict)
     model.eval()
     print(f"[ai] Modèle chargé: {checkpoint_path} sur {device}")
-    if migrated:
+    if migration["action_head"]:
         print("[ai] Checkpoint legacy adapte automatiquement de 4163 a 4099 actions")
+    if migration["value_head"]:
+        print("[ai] Checkpoint legacy adapte automatiquement le value head de 1 a 4 canaux")
     print(
         f"[ai] Arch: num_filters={cfg.num_filters}, num_res_blocks={cfg.num_res_blocks}, "
         f"policy_head_filters={cfg.policy_head_filters}, value_head_hidden={cfg.value_head_hidden}"
