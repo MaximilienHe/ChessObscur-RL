@@ -85,20 +85,18 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
     """
     T = buffer.T
     games_completed = 0
-    total_rewards = 0.0
+    total_rewards = torch.zeros((), device=obs.device)
     white_wins = 0
     black_wins = 0
     draws = 0
 
-    white_reward_sum = 0.0
-    black_reward_sum = 0.0
-    white_reward_count = 0
-    black_reward_count = 0
+    white_reward_sum = torch.zeros((), device=obs.device)
+    black_reward_sum = torch.zeros((), device=obs.device)
+    white_reward_count = torch.zeros((), dtype=torch.int64, device=obs.device)
+    black_reward_count = torch.zeros((), dtype=torch.int64, device=obs.device)
 
-    defense_phases_seen = 0
-    parry_phases_seen = 0
-    move_phases_seen = 0
-    total_legal_actions = 0
+    phase_counts = torch.zeros(3, dtype=torch.int64, device=obs.device)
+    total_legal_actions = torch.zeros((), dtype=torch.int64, device=obs.device)
     game_lengths = []
 
     # v8: league win tracking
@@ -113,10 +111,10 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
         for t in range(T):
             legal_mask = env.get_legal_mask()
 
-            move_phases_seen += (env.phase == 0).sum().item()
-            defense_phases_seen += (env.phase == 1).sum().item()
-            parry_phases_seen += (env.phase == 2).sum().item()
-            total_legal_actions += legal_mask.sum().item()
+            phase_counts[0] += (env.phase == 0).sum()
+            phase_counts[1] += (env.phase == 1).sum()
+            phase_counts[2] += (env.phase == 2).sum()
+            total_legal_actions += legal_mask.sum()
 
             no_legal = ~legal_mask.any(dim=1)
             if no_legal.any():
@@ -124,7 +122,9 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
 
             # Main network evaluates ALL envs (for PPO log_probs and values)
             with torch.amp.autocast('cuda', enabled=use_amp):
-                action, log_prob, entropy, value = network.get_action_and_value(obs, legal_mask)
+                policy_logits, value = network(obs, legal_mask)
+                dist = torch.distributions.Categorical(logits=policy_logits)
+                action = dist.sample()
 
             # v8 league: override actions for league envs when it's the opponent's turn
             if use_league:
@@ -135,17 +135,12 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
                 if opp_envs.any():
                     opp_idx = opp_envs.nonzero(as_tuple=True)[0]
                     with torch.amp.autocast('cuda', enabled=use_amp):
-                        opp_action, _, _, _ = opponent_net.get_action_and_value(
-                            obs[opp_idx], legal_mask[opp_idx]
-                        )
-                    action[opp_idx] = opp_action
-                    # Re-evaluate log_prob for the opponent-chosen action from
-                    # the main network's perspective (needed for correct PPO ratio)
-                    with torch.amp.autocast('cuda', enabled=use_amp):
-                        _, log_prob_reeval, _, _ = network.get_action_and_value(
-                            obs[opp_idx], legal_mask[opp_idx], opp_action
-                        )
-                    log_prob[opp_idx] = log_prob_reeval
+                        opp_policy_logits, _ = opponent_net(obs[opp_idx], legal_mask[opp_idx])
+                        opp_dist = torch.distributions.Categorical(logits=opp_policy_logits)
+                        action[opp_idx] = opp_dist.sample()
+
+            log_prob = dist.log_prob(action)
+            value = value.squeeze(-1)
 
             next_obs, reward, done, info = env.step(action)
 
@@ -155,10 +150,10 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
             white_mask = agent_w
             black_mask = ~agent_w
 
-            white_reward_sum += reward[white_mask].sum().item()
-            black_reward_sum += reward[black_mask].sum().item()
-            white_reward_count += white_mask.sum().item()
-            black_reward_count += black_mask.sum().item()
+            white_reward_sum += reward[white_mask].sum()
+            black_reward_sum += reward[black_mask].sum()
+            white_reward_count += white_mask.sum()
+            black_reward_count += black_mask.sum()
 
             if done.any():
                 n_done = done.sum().item()
@@ -183,24 +178,27 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
                                      ((league_results == 2) & ~league_agent_white)
                         league_wins += agent_wins.sum().item()
 
-            total_rewards += reward.sum().item()
+            total_rewards += reward.sum()
             obs = next_obs
 
     network.train()
 
     total_steps = T * env.N
+    move_phases_seen = phase_counts[0].item()
+    defense_phases_seen = phase_counts[1].item()
+    parry_phases_seen = phase_counts[2].item()
     stats = {
         "rollout/games_completed": games_completed,
-        "rollout/mean_reward": total_rewards / total_steps,
+        "rollout/mean_reward": total_rewards.item() / total_steps,
         "rollout/white_wins": white_wins,
         "rollout/black_wins": black_wins,
         "rollout/draws": draws,
         "rollout/phase_move_frac": move_phases_seen / total_steps,
         "rollout/phase_defense_frac": defense_phases_seen / total_steps,
         "rollout/phase_parry_frac": parry_phases_seen / total_steps,
-        "rollout/avg_legal_actions": total_legal_actions / total_steps,
-        "rollout/white_mean_reward": white_reward_sum / max(white_reward_count, 1),
-        "rollout/black_mean_reward": black_reward_sum / max(black_reward_count, 1),
+        "rollout/avg_legal_actions": total_legal_actions.item() / total_steps,
+        "rollout/white_mean_reward": white_reward_sum.item() / max(white_reward_count.item(), 1),
+        "rollout/black_mean_reward": black_reward_sum.item() / max(black_reward_count.item(), 1),
     }
 
     if games_completed > 0:

@@ -62,7 +62,7 @@ class Config:
     curriculum_start_steps: int = 150
     curriculum_step_increase: int = 10
     curriculum_every_n_timesteps: int = 5_000_000  # every 5M timesteps
-    curriculum_max_steps_cap: int = 180
+    curriculum_max_steps_cap: int = 220  # v10: 180→220, longer games for endgame learning
 
     # ── Observation ──
     obs_planes: int = 19
@@ -90,7 +90,7 @@ class Config:
     lr_min: float = 3e-5            # v8: LR floor (never go to zero)
     lr_warmup_steps: int = 1_000_000  # v8: linear warmup over first 1M steps
     lr_restart_period: int = 100_000_000  # v8: cosine restart every 100M steps
-    lr_restart_decay: float = 0.5    # v8: each restart ceiling = prev * decay
+    lr_restart_decay: float = 0.7    # v10: 0.5→0.7, less aggressive decay (LR stayed active longer)
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.12

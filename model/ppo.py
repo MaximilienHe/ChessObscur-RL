@@ -145,6 +145,7 @@ class PPOTrainer:
                                 _, new_log_probs, entropy, new_values = self.net.get_action_and_value(
                                     mb_obs, mb_legal, mb_actions
                                 )
+                                new_values_norm = (new_values - returns_mean) / returns_std
 
                                 log_ratio = new_log_probs - mb_old_log_probs
                                 ratio = torch.exp(log_ratio)
@@ -159,14 +160,14 @@ class PPOTrainer:
                                 # head always receives well-scaled gradients.
                                 if cfg.clip_value > 0:
                                     v_clipped = mb_old_values_norm + torch.clamp(
-                                        new_values - mb_old_values_norm,
+                                        new_values_norm - mb_old_values_norm,
                                         -cfg.clip_value, cfg.clip_value
                                     )
-                                    v_loss1 = (new_values - mb_returns_norm) ** 2
+                                    v_loss1 = (new_values_norm - mb_returns_norm) ** 2
                                     v_loss2 = (v_clipped - mb_returns_norm) ** 2
                                     v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
                                 else:
-                                    v_loss = 0.5 * ((new_values - mb_returns_norm) ** 2).mean()
+                                    v_loss = 0.5 * ((new_values_norm - mb_returns_norm) ** 2).mean()
 
                                 entropy_loss = entropy.mean()
 

@@ -10,8 +10,6 @@ Architecture:
 - When it's the opponent's turn in league envs, the opponent network picks the action.
 - The learning network still evaluates all states for PPO (log_probs, values).
 """
-import os
-import copy
 import random
 import torch
 import torch.nn as nn
@@ -19,6 +17,8 @@ from typing import Optional, List
 
 from config import Config
 from model.network import ChessObscurNetwork
+
+SnapshotEntry = tuple[int, dict[str, torch.Tensor]]
 
 
 class LeaguePool:
@@ -28,9 +28,49 @@ class LeaguePool:
         self.cfg = cfg
         self.max_checkpoints = cfg.league_max_checkpoints
         self.snapshot_interval = cfg.league_checkpoint_interval
-        self._snapshots: List[dict] = []  # list of state_dicts (on CPU)
+        self._snapshots: List[SnapshotEntry] = []
         self._opponent_net: Optional[ChessObscurNetwork] = None
         self._last_snapshot_step = 0
+
+    def _target_snapshot_steps(self, latest_step: int) -> List[int]:
+        ages = [0]
+        if self.max_checkpoints > 1:
+            ages.append(self.snapshot_interval)
+        if self.max_checkpoints > 2:
+            ages.append(2 * self.snapshot_interval)
+
+        age = 5 * self.snapshot_interval
+        while len(ages) < self.max_checkpoints:
+            ages.append(age)
+            age *= 2
+
+        return sorted(max(0, latest_step - target_age) for target_age in ages[:self.max_checkpoints])
+
+    def _score_snapshot_set(self, snapshots: List[SnapshotEntry]) -> int:
+        steps = sorted(step for step, _ in snapshots)
+        targets = self._target_snapshot_steps(steps[-1])
+        return sum(abs(step - target) for step, target in zip(steps, targets))
+
+    def _trim_snapshots(self):
+        if len(self._snapshots) <= self.max_checkpoints:
+            return
+
+        latest_step = self._snapshots[-1][0]
+        best_snapshots = None
+        best_score = None
+
+        for remove_idx in range(len(self._snapshots)):
+            candidate = self._snapshots[:remove_idx] + self._snapshots[remove_idx + 1:]
+            if candidate[-1][0] != latest_step:
+                continue
+
+            score = self._score_snapshot_set(candidate)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_snapshots = candidate
+
+        if best_snapshots is not None:
+            self._snapshots = best_snapshots
 
     def _create_opponent_net(self) -> ChessObscurNetwork:
         """Create an opponent network on the same device as training."""
@@ -49,6 +89,8 @@ class LeaguePool:
 
     def maybe_snapshot(self, network: nn.Module, global_step: int):
         """Take a snapshot of the current network if enough steps have passed."""
+        if self.max_checkpoints <= 0:
+            return
         if global_step - self._last_snapshot_step < self.snapshot_interval:
             return
         if global_step < self.snapshot_interval:
@@ -62,9 +104,8 @@ class LeaguePool:
             clean_key = k.replace("_orig_mod.", "")
             cpu_state[clean_key] = v.cpu().clone()
 
-        self._snapshots.append(cpu_state)
-        if len(self._snapshots) > self.max_checkpoints:
-            self._snapshots.pop(0)
+        self._snapshots.append((global_step, cpu_state))
+        self._trim_snapshots()
 
         self._last_snapshot_step = global_step
         print(f"[league] Snapshot taken at step {global_step:,} "
@@ -81,8 +122,8 @@ class LeaguePool:
         if self._opponent_net is None:
             self._opponent_net = self._create_opponent_net()
 
-        snapshot = random.choice(self._snapshots)
-        self._opponent_net.load_state_dict(snapshot)
+        _, snapshot_state = random.choice(self._snapshots)
+        self._opponent_net.load_state_dict(snapshot_state)
         return self._opponent_net
 
     @property

@@ -83,6 +83,8 @@ class ChessObscurEnv:
         self.zobrist_history = torch.zeros(num_envs, MAX_ZOBRIST_HISTORY,
                                            dtype=torch.int64, device=dev)
         self.zobrist_len = torch.zeros(num_envs, dtype=torch.int16, device=dev)
+        self._cached_move_legal_mask = torch.zeros(num_envs, 4096, dtype=torch.bool, device=dev)
+        self._cached_move_legal_valid = False
 
         # ── Parry outcome counters ──
         self.parry_self_capture_count = 0
@@ -197,7 +199,10 @@ class ChessObscurEnv:
         # v9: reset zobrist history and record the starting position.
         self.zobrist_history[mask] = 0
         self.zobrist_len[mask] = 0
-        self._update_zobrist(mask.nonzero(as_tuple=True)[0])
+        reset_idx = mask.nonzero(as_tuple=True)[0]
+        self._update_zobrist(reset_idx)
+        if self._cached_move_legal_valid:
+            self._cached_move_legal_mask[reset_idx] = self._compute_move_legal_mask(reset_idx)
         return self._build_obs()
 
     def set_max_steps(self, new_max_steps: int):
@@ -289,19 +294,21 @@ class ChessObscurEnv:
         return h
 
     def _update_zobrist(self, env_indices):
-        """Record current position hash in history."""
+        """Record current position hash in history. Returns the hash for reuse."""
         if env_indices.shape[0] == 0:
-            return
+            return torch.zeros(0, dtype=torch.int64, device=self.device)
         h = self._compute_zobrist_hash(env_indices)
         lens = self.zobrist_len[env_indices].long().clamp(max=MAX_ZOBRIST_HISTORY - 1)
         self.zobrist_history[env_indices, lens] = h
         self.zobrist_len[env_indices] = (lens + 1).clamp(max=MAX_ZOBRIST_HISTORY).short()
+        return h
 
-    def _check_threefold(self, env_indices):
+    def _check_threefold(self, env_indices, h=None):
         """Check if current position has appeared 3+ times. Returns bool mask."""
         if env_indices.shape[0] == 0:
             return torch.zeros(0, dtype=torch.bool, device=self.device)
-        h = self._compute_zobrist_hash(env_indices)
+        if h is None:
+            h = self._compute_zobrist_hash(env_indices)
         M = env_indices.shape[0]
         lens = self.zobrist_len[env_indices].long()
         history = self.zobrist_history[env_indices]  # (M, MAX_ZOBRIST_HISTORY)
@@ -606,6 +613,16 @@ class ChessObscurEnv:
     #  LEGAL MOVE MASK (v9: vectorized parry)
     # ══════════════════════════════════════════════
 
+    def _compute_move_legal_mask(self, idx):
+        if idx.shape[0] == 0:
+            return torch.zeros(0, 4096, dtype=torch.bool, device=self.device)
+        pseudo = self._gen_pseudo_legal_batched(
+            self.board[idx], self.turn_is_white[idx], self.en_passant[idx], self.castling[idx]
+        )
+        return self._filter_king_safety_batched(
+            self.board[idx], pseudo, self.turn_is_white[idx], self.en_passant[idx]
+        )
+
     def get_legal_mask(self):
         N, dev = self.N, self.device
         mask = torch.zeros(N, 4099, dtype=torch.bool, device=dev)
@@ -619,10 +636,12 @@ class ChessObscurEnv:
         in_move = self.phase == PHASE_MOVE
         if in_move.any():
             idx = in_move.nonzero(as_tuple=True)[0]
-            pseudo = self._gen_pseudo_legal_batched(self.board[idx], self.turn_is_white[idx],
-                                                     self.en_passant[idx], self.castling[idx])
-            legal = self._filter_king_safety_batched(self.board[idx], pseudo,
-                                                      self.turn_is_white[idx], self.en_passant[idx])
+            if self._cached_move_legal_valid:
+                legal = self._cached_move_legal_mask[idx]
+            else:
+                legal = self._compute_move_legal_mask(idx)
+                self._cached_move_legal_mask[idx] = legal
+                self._cached_move_legal_valid = True
             mask[in_move, :4096] = legal
 
         in_parry = self.phase == PHASE_PARRY
@@ -740,6 +759,7 @@ class ChessObscurEnv:
     def step(self, actions):
         N, dev = self.N, self.device
         reward = torch.full((N,), REWARD_STEP_PENALTY, device=dev)
+        self._cached_move_legal_valid = False
 
         in_def = self.phase == PHASE_DEFENSE
         if in_def.any(): self._resolve_defense_batched(actions, in_def, reward)
@@ -750,9 +770,11 @@ class ChessObscurEnv:
 
         self._check_endgame(reward)
 
-        active = self.phase != PHASE_FINISHED
-        self.full_move_count[active] += 1
+        # v10: only count actual moves, not defense/parry sub-phases.
+        # This was inflating timeout detection and progressive draw penalty.
+        self.full_move_count[in_move] += 1
 
+        active = self.phase != PHASE_FINISHED
         over = (self.full_move_count >= self.max_steps * 2) & active
         if over.any():
             self.phase[over] = PHASE_FINISHED; self.result[over] = RESULT_DRAW
@@ -766,8 +788,8 @@ class ChessObscurEnv:
         still_playing = (self.phase == PHASE_MOVE)
         if still_playing.any():
             sp_idx = still_playing.nonzero(as_tuple=True)[0]
-            self._update_zobrist(sp_idx)
-            threefold = self._check_threefold(sp_idx)
+            zh = self._update_zobrist(sp_idx)
+            threefold = self._check_threefold(sp_idx, zh)
             if threefold.any():
                 tf_idx = sp_idx[threefold]
                 self.phase[tf_idx] = PHASE_FINISHED
@@ -782,14 +804,15 @@ class ChessObscurEnv:
         }
 
         if done.any():
-            reward[done] += reward_terminal(
-                self.result,
-                self.agent_is_white,
-                board=self.board,
+            done_idx = done.nonzero(as_tuple=True)[0]
+            reward[done_idx] += reward_terminal(
+                self.result[done_idx],
+                self.agent_is_white[done_idx],
+                board=self.board[done_idx],
                 piece_values=self.tables.piece_values,
-                full_move_count=self.full_move_count,
+                full_move_count=self.full_move_count[done_idx],
                 max_steps=self.max_steps
-            )[done]
+            )
             self.reset(done)
 
         return self._build_obs(), reward, done, info
@@ -1239,16 +1262,21 @@ class ChessObscurEnv:
 
     def _check_endgame(self, reward):
         active = (self.phase == PHASE_MOVE)
-        if not active.any(): return
+        if not active.any():
+            self._cached_move_legal_valid = True
+            return
         bds = self.board[active]; ai = active.nonzero(as_tuple=True)[0]
         wm = ~(bds == W_KING).any(dim=1); bm = ~(bds == B_KING).any(dim=1)
         if wm.any(): self.phase[ai[wm]] = PHASE_FINISHED; self.result[ai[wm]] = RESULT_BLACK_WIN
         if bm.any(): self.phase[ai[bm]] = PHASE_FINISHED; self.result[ai[bm]] = RESULT_WHITE_WIN
         sa = (self.phase == PHASE_MOVE)
-        if not sa.any(): return
+        if not sa.any():
+            self._cached_move_legal_valid = True
+            return
         si = sa.nonzero(as_tuple=True)[0]
-        pseudo = self._gen_pseudo_legal_batched(self.board[si], self.turn_is_white[si], self.en_passant[si], self.castling[si])
-        legal = self._filter_king_safety_batched(self.board[si], pseudo, self.turn_is_white[si], self.en_passant[si])
+        legal = self._compute_move_legal_mask(si)
+        self._cached_move_legal_mask[si] = legal
+        self._cached_move_legal_valid = True
         nm = ~legal.any(dim=1)
         if nm.any():
             ni = si[nm]; ic = self._is_in_check_batched(self.board[ni], self.turn_is_white[ni])
