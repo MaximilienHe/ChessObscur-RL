@@ -2,6 +2,19 @@
 
 ---
 
+## Note de mise à jour
+
+Ce document conserve volontairement l'historique détaillé des premières versions (`v1` à `v3`) et plusieurs explications rédigées à cette époque.
+
+Le code du repository a toutefois beaucoup évolué depuis. Pour éviter d'écraser l'ancien contenu, les changements récents ont été ajoutés dans une section dédiée en fin de document : voir **[19. Addendum — Mises à jour récentes (v8 → v10)](#19-addendum--mises-à-jour-récentes-v8--v10)**.
+
+En pratique :
+
+- les sections `6`, `8`, `11`, `12` et `15` contiennent encore des valeurs historiques utiles pour comprendre l'évolution du projet ;
+- la section `19` décrit l'état **actuel** du code.
+
+---
+
 ## Table des matières
 
 1. [Introduction et contexte](#1-introduction-et-contexte)
@@ -22,6 +35,7 @@
 16. [Optimisations de performance](#16-optimisations-de-performance)
 17. [Monitoring et diagnostics](#17-monitoring-et-diagnostics)
 18. [Historique des itérations (v1 → v3)](#18-historique-des-itérations)
+19. [Addendum — Mises à jour récentes (v8 → v10)](#19-addendum--mises-à-jour-récentes-v8--v10)
 
 ---
 
@@ -732,3 +746,186 @@ Problèmes observés via TensorBoard :
 ---
 
 *Ce document constitue la documentation technique complète du pipeline d'entraînement RL de Chess Obscur. Chaque décision de conception — de l'architecture réseau aux valeurs de reward — est le résultat d'itérations guidées par les métriques observées pendant l'entraînement.*
+
+---
+
+## 19. Addendum — Mises à jour récentes (v8 → v10)
+
+Cette section complète le document historique ci-dessus. Elle décrit les changements importants apportés dans les versions récentes et l'état du code actuellement présent dans le repository.
+
+### 19.1 Vue d'ensemble
+
+Depuis les versions documentées dans les sections précédentes, le projet a connu trois changements majeurs :
+
+- **v8** a relancé l'entraînement sur une base plus ambitieuse : réseau plus grand, nouveau schedule de learning rate, league training, reward shaping anti-draw plus agressif.
+- **v9** a refactoré l'environnement GPU en profondeur : action space nettoyé, environnement plus vectorisé, détection de répétition, rewards terminaux plus cohérents.
+- **v10** a corrigé plusieurs biais de training révélés par l'audit du run 500M et a privilégié les changements qui améliorent la **force finale du modèle**, pas seulement le débit.
+
+### 19.2 v8 — Relance majeure de l'entraînement
+
+La `v8` correspond à un redémarrage important du pipeline à partir des constats faits sur les runs précédents.
+
+Changements principaux :
+
+- **Réseau élargi** :
+  - backbone porté à **15 blocs résiduels** au lieu de 10 ;
+  - largeur du trunk portée à **192 filtres** au lieu de 128 ;
+  - `policy_head_filters` porté à **64** ;
+  - `value_head_hidden` porté à **1024**.
+- **Nouveau schedule de learning rate** :
+  - abandon du decay linéaire vers zéro ;
+  - remplacement par un **cosine annealing avec warm restarts** ;
+  - ajout d'un **plancher `lr_min = 3e-5`** pour éviter que l'entraînement ne "meure" trop tôt.
+- **League training** :
+  - environ **30%** des environnements jouent contre d'anciens snapshots ;
+  - objectif : casser l'équilibre de Nash centré sur le nul et forcer le modèle à exploiter des politiques plus faibles.
+- **Reward shaping revu** :
+  - **draw penalty progressive** selon la longueur de la partie ;
+  - rebalancing de la parade (`good_move` renforcé, `skip` plus pénalisé) ;
+  - rewards conçus pour mieux distinguer les nuls précoces des nuls tardifs.
+
+### 19.3 v9 — Refonte de l'environnement GPU
+
+La `v9` a surtout amélioré la **cohérence du moteur de jeu** et sa vectorisation.
+
+Changements principaux :
+
+- **Espace d'actions nettoyé** :
+  - suppression des slots morts de sous-promotion ;
+  - passage de **4163 actions** à **4099 actions** :
+    - `0..4095` : coups de plateau ;
+    - `4096..4098` : `BLOCK`, `PARRY`, `ACCEPT_LOSS`.
+- **Step plus vectorisé** :
+  - `_resolve_defense_batched`, `_apply_moves_batched`, `_apply_parry_batched` et plusieurs parties du pipeline ont été refactorés pour réduire les boucles Python et les synchronisations CPU inutiles.
+- **Observation et legal masks optimisés** :
+  - `_build_obs()` est plus batché ;
+  - la génération des coups légaux en parade est vectorisée.
+- **Zobrist hashing + répétition** :
+  - ajout d'un historique de hash de position ;
+  - détection du **threefold repetition** côté environnement.
+- **Rewards terminaux plus cohérents** :
+  - récompenses de victoire/défaite symétriques ;
+  - les nuls ne sont plus punis plus sévèrement qu'une défaite.
+
+Impact sur la lecture du reste du document :
+
+- la **section 6** parle encore d'un action space à `4163` actions : c'est désormais **historique** ;
+- la **section 11** montre encore des `legal_masks` de taille `4163` : la taille actuelle est **4099**.
+
+### 19.4 v10 — Corrections issues de l'audit 500M
+
+La `v10` correspond aux changements effectués après audit d'un run terminé à environ **506M steps**. L'objectif a été de corriger ce qui dégradait la qualité du modèle final.
+
+#### 19.4.1 Corrections qui affectent directement la qualité d'apprentissage
+
+- **Correction de `full_move_count`** :
+  - auparavant, le compteur augmentait à chaque step d'environnement, y compris pendant `PHASE_DEFENSE` et `PHASE_PARRY` ;
+  - maintenant, il n'augmente que sur les vrais demi-coups (`PHASE_MOVE`) ;
+  - cela corrige :
+    - les timeouts déclenchés trop tôt ;
+    - la draw penalty progressive artificiellement trop sévère ;
+    - les métriques `game/avg_length` gonflées.
+- **Value head élargi** :
+  - passage d'un bottleneck `Conv 192 -> 1 canal` à **`Conv 192 -> 4 canaux`** ;
+  - le MLP de valeur reçoit maintenant **256 features spatiales** au lieu de 64 ;
+  - cela conserve davantage d'information positionnelle avant la prédiction de valeur.
+- **Curriculum learning étendu** :
+  - `curriculum_max_steps_cap` passe de **180** à **220** ;
+  - objectif : exposer plus souvent le réseau à des fins de partie plus longues.
+- **Decay LR moins agressif** :
+  - `lr_restart_decay` passe de **0.5** à **0.7** ;
+  - cela évite que le learning rate tombe trop vite sur le plancher et laisse plus de capacité d'apprentissage après les premiers restarts.
+- **League pool plus diversifié** :
+  - le pool d'adversaires n'est plus purement FIFO ;
+  - les snapshots gardés sont désormais espacés de manière **quasi exponentielle** pour conserver à la fois du récent et de l'ancien.
+
+#### 19.4.2 Changements complémentaires
+
+Ces changements ont aussi été intégrés, même s'ils visent surtout la propreté d'exécution :
+
+- suppression du **double calcul Zobrist** sur les positions encore actives ;
+- calcul du reward terminal uniquement pour les environnements **`done`** ;
+- réutilisation d'un **cache post-step** des legal moves pour éviter de recalculer inutilement le masque légal juste après `_check_endgame()` ;
+- réduction de certains coûts de logging/rollout dans `training/self_play.py`.
+
+### 19.5 État actuel du code
+
+Cette sous-section résume les valeurs et choix réellement en vigueur dans le code actuel.
+
+#### Environnement et action space
+
+- `num_envs = 2048`
+- `rollout_steps = 256`
+- `total_actions = 4099`
+- phases :
+  - `PHASE_MOVE = 0`
+  - `PHASE_DEFENSE = 1`
+  - `PHASE_PARRY = 2`
+  - `PHASE_FINISHED = 3`
+
+#### Réseau
+
+- observation : **`(19, 8, 8)`**
+- trunk :
+  - **15 blocs résiduels**
+  - **192 filtres**
+- policy head :
+  - conv `192 -> 64`
+  - projection finale vers **4099 logits**
+- value head :
+  - conv `192 -> 4`
+  - `Linear(4 * 8 * 8 -> 1024 -> 1)`
+  - **pas de `tanh`** en sortie
+
+#### PPO et optimisation
+
+- `lr = 3e-4`
+- `lr_min = 3e-5`
+- `lr_warmup_steps = 1_000_000`
+- `lr_restart_period = 100_000_000`
+- `lr_restart_decay = 0.7`
+- `clip_eps = 0.12`
+- `clip_value = 1.0`
+- `entropy_coef = 0.015`
+- `entropy_coef_min = 0.008`
+- `entropy_coef_decay_steps = 800_000_000`
+- `ppo_epochs = 3`
+- `num_minibatches = 8`
+- `microbatch_size = 8192`
+
+#### Curriculum et training schedule
+
+- `curriculum_start_steps = 150`
+- `curriculum_step_increase = 10`
+- `curriculum_every_n_timesteps = 5_000_000`
+- `curriculum_max_steps_cap = 220`
+- `total_timesteps = 500_000_000`
+
+#### League training
+
+- activée par défaut ;
+- `league_frac = 0.30`
+- snapshot toutes les **10M steps**
+- pool de **10 checkpoints**
+- conservation de snapshots plus espacés dans le temps qu'un simple FIFO
+
+### 19.6 Compatibilité checkpoints et serveur d'inférence
+
+Le code actuel sait charger des checkpoints plus anciens malgré les changements d'architecture récents :
+
+- migration automatique de l'ancien policy head **`4163 -> 4099`** ;
+- migration automatique de l'ancien value head **`1 canal -> 4 canaux`** ;
+- si une migration de poids est nécessaire, l'état de l'optimizer n'est pas restauré, ce qui évite de recharger un état incompatible.
+
+Le serveur `ai_server.py` a été adapté à cette logique : il infère l'architecture depuis le `state_dict` et applique ces migrations si nécessaire.
+
+### 19.7 Comment lire le document historique
+
+Le reste du document reste utile pour comprendre :
+
+- la philosophie générale du pipeline RL ;
+- la logique PPO ;
+- la structure de l'environnement ;
+- l'évolution historique des décisions de design.
+
+En revanche, pour les chiffres exacts et l'architecture utilisée **aujourd'hui**, il faut considérer la section `19` comme la référence principale.
