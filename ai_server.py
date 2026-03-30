@@ -26,10 +26,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model.network import ChessObscurNetwork
 from config import Config
 from env.chess_obscur_env import (
+    ChessObscurEnv,
+    PHASE_MOVE,
+    PHASE_DEFENSE,
+    PHASE_PARRY,
     ACTION_ATTEMPT_BLOCK,
     ACTION_ATTEMPT_PARRY,
     ACTION_ACCEPT_LOSS,
 )
+from model.mcts import mcts_search
 from utils.checkpoint import prepare_model_state_dict
 
 TOTAL_ACTIONS = ACTION_ACCEPT_LOSS + 1
@@ -66,6 +71,10 @@ class MoveRequest(BaseModel):
     # Infos de défense (pour phase defense)
     pendingAttackerPiece: Optional[str] = None
     pendingDefenderPiece: Optional[str] = None
+    pendingAttackerSq: Optional[int] = None
+    pendingTargetSq: Optional[int] = None
+    pendingAttackerColor: Optional[str] = None
+    fullMoveCount: Optional[int] = None
 
     # ── FIX: zones QTE transmises par ai_client.js ──
     qteZones: Optional[QteZones] = None
@@ -365,6 +374,75 @@ def build_legal_mask_from_request(req: MoveRequest) -> torch.Tensor:
     return mask
 
 
+def build_env_from_request(req: MoveRequest) -> Optional[ChessObscurEnv]:
+    """Reconstruct a 1-env state for stronger search-based inference."""
+    if server_cfg is None or device is None:
+        return None
+
+    phase_map = {"move": PHASE_MOVE, "defense": PHASE_DEFENSE, "parry_move": PHASE_PARRY}
+    phase = phase_map.get(req.phase, PHASE_MOVE)
+
+    if phase == PHASE_DEFENSE:
+        if req.pendingAttackerSq is None or req.pendingTargetSq is None or req.pendingAttackerColor is None:
+            return None
+    if phase == PHASE_PARRY:
+        if req.parrySquare is None or req.parryController is None:
+            return None
+
+    env = ChessObscurEnv(
+        1,
+        device=str(device),
+        max_steps=server_cfg.curriculum_max_steps_cap,
+        frame_stack=server_cfg.frame_stack,
+    )
+
+    board = board_js_to_tensor(req.board).to(device)
+    env.board[0] = board
+    env.turn_is_white[0] = (req.turn == "w")
+    env.phase[0] = phase
+    env.result[0] = 0
+    env.castling[0] = torch.tensor([
+        bool(req.castling.get("wK", False)),
+        bool(req.castling.get("wQ", False)),
+        bool(req.castling.get("bK", False)),
+        bool(req.castling.get("bQ", False)),
+    ], dtype=torch.bool, device=device)
+    env.en_passant[0] = -1 if req.enPassant is None else int(req.enPassant)
+    env.check_attempts[0, 0] = int(req.checkAttempts.get("w", 0))
+    env.check_attempts[0, 1] = int(req.checkAttempts.get("b", 0))
+    env.half_moves[0] = int(req.halfMoves)
+    inferred_full_move = req.fullMoveCount
+    if inferred_full_move is None:
+        inferred_full_move = min(int(req.halfMoves), env.max_steps * 2)
+    env.full_move_count[0] = int(inferred_full_move)
+
+    env.pending_attacker_sq[0] = -1
+    env.pending_target_sq[0] = -1
+    env.pending_attacker_piece[0] = PIECE_TO_INT.get(req.pendingAttackerPiece, 0)
+    env.pending_defender_piece[0] = PIECE_TO_INT.get(req.pendingDefenderPiece, 0)
+    env.pending_attacker_color_white[0] = False
+    env.parry_square[0] = -1
+    env.parry_controller_is_white[0] = False
+    env.agent_is_white[0] = env.turn_is_white[0]
+
+    if phase == PHASE_DEFENSE:
+        env.pending_attacker_sq[0] = int(req.pendingAttackerSq)
+        env.pending_target_sq[0] = int(req.pendingTargetSq)
+        env.pending_attacker_color_white[0] = (req.pendingAttackerColor == "w")
+
+    if phase == PHASE_PARRY:
+        env.parry_square[0] = int(req.parrySquare)
+        env.parry_controller_is_white[0] = (req.parryController == "w")
+
+    env.board_history[0] = board.unsqueeze(0).expand(env.frame_stack, -1)
+    env._hist_idx = 0
+    env.zobrist_history[0] = 0
+    env.zobrist_len[0] = 0
+    env._cached_move_legal_valid = False
+    env._update_zobrist(torch.tensor([0], device=device))
+    return env
+
+
 def idx_to_sq(idx: int) -> str:
     f = idx % 8
     r = idx // 8
@@ -415,8 +493,12 @@ def compute_stop_ms_for_zone(action: int, zones: Optional[QteZones], duration_ms
 app = FastAPI(title="Chess Obscur AI")
 model: ChessObscurNetwork = None
 device: torch.device = None
-temperature: float = 0.5
+temperature: float = 0.0
 server_cfg: Config = None  # v11: store config for frame_stack inference
+mcts_enabled: bool = False
+mcts_num_simulations: int = 0
+mcts_c_puct: float = 1.5
+mcts_temperature: float = 0.0
 
 
 def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor], cfg: Config) -> None:
@@ -527,21 +609,38 @@ def get_move(req: MoveRequest):
     fs = server_cfg.frame_stack if server_cfg is not None else 4
     obs = build_obs_from_request(req, frame_stack=fs).to(device)
     legal_mask = build_legal_mask_from_request(req).to(device)
+    action = None
 
     with torch.inference_mode():
-        policy_logits, value = model(obs, legal_mask)
+        if mcts_enabled and req.phase != "defense":
+            mcts_env = build_env_from_request(req)
+            if mcts_env is not None:
+                mcts_action = mcts_search(
+                    mcts_env,
+                    model,
+                    env_idx=0,
+                    num_simulations=mcts_num_simulations,
+                    c_puct=mcts_c_puct,
+                    temperature=mcts_temperature,
+                    device=device,
+                )
+                if 0 <= mcts_action < TOTAL_ACTIONS and legal_mask[0, mcts_action]:
+                    action = int(mcts_action)
 
-        # True greedy mode for temperature <= 0
-        if temperature <= 0:
-            greedy_logits = policy_logits.masked_fill(~legal_mask, -1e8)
-            action = torch.argmax(greedy_logits, dim=-1).item()
-        else:
-            # Appliquer température
-            policy_logits = policy_logits / temperature
-            # Masquer les actions illégales
-            policy_logits = policy_logits.masked_fill(~legal_mask, -1e8)
-            probs = F.softmax(policy_logits, dim=-1)
-            action = torch.multinomial(probs, 1).item()
+        if action is None:
+            policy_logits, value = model(obs, legal_mask)
+
+            # True greedy mode for temperature <= 0
+            if temperature <= 0:
+                greedy_logits = policy_logits.masked_fill(~legal_mask, -1e8)
+                action = torch.argmax(greedy_logits, dim=-1).item()
+            else:
+                # Appliquer température
+                policy_logits = policy_logits / temperature
+                # Masquer les actions illégales
+                policy_logits = policy_logits.masked_fill(~legal_mask, -1e8)
+                probs = F.softmax(policy_logits, dim=-1)
+                action = torch.multinomial(probs, 1).item()
 
     # Décoder l'action
     if req.phase == "defense":
@@ -612,8 +711,14 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", required=True, help="Chemin vers le checkpoint .pt")
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--device", default="cpu", help="cpu ou cuda")
-    parser.add_argument("--temperature", type=float, default=0.5,
+    parser.add_argument("--temperature", type=float, default=0.0,
                         help="Température de sampling (0=greedy)")
+    parser.add_argument("--mcts-simulations", type=int, default=0,
+                        help="Nombre de simulations MCTS (0=desactive)")
+    parser.add_argument("--mcts-c-puct", type=float, default=None,
+                        help="Constante d'exploration MCTS")
+    parser.add_argument("--mcts-temperature", type=float, default=0.0,
+                        help="Temperature de selection finale MCTS")
     parser.add_argument("--value-head-hidden", type=int, default=None,
                         help="Override de l'architecture checkpoint si besoin")
     parser.add_argument("--num-res-blocks", type=int, default=None,
@@ -633,4 +738,8 @@ if __name__ == "__main__":
         num_filters=args.num_filters,
         policy_head_filters=args.policy_head_filters,
     )
+    mcts_enabled = args.mcts_simulations > 0
+    mcts_num_simulations = args.mcts_simulations
+    mcts_c_puct = args.mcts_c_puct if args.mcts_c_puct is not None else server_cfg.mcts_c_puct
+    mcts_temperature = args.mcts_temperature
     uvicorn.run(app, host="0.0.0.0", port=args.port)

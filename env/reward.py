@@ -38,28 +38,29 @@ REWARD_DRAW_LATE = -1.0        # v9: timeout / 50-move (always < |REWARD_LOSE|)
 MATERIAL_SCALE = 0.15
 
 # ── Intermediate shaping ──
-REWARD_CAPTURE_SCALE = 0.25
-REWARD_LOSE_PIECE_SCALE = -0.06
+# v12: rewards are now interpreted from the CURRENT ACTOR'S perspective.
+# Losing material must therefore carry enough negative signal so the previous
+# actor can receive a meaningful positive return after the perspective flip.
+REWARD_LOSE_PIECE_SCALE = -0.18
 
 # ── Check escape shaping ──
 REWARD_CHECK_ESCAPE_SUCCESS = 0.06
-REWARD_CHECK_GIVEN = 0.15
-REWARD_CHECK_2ND_ATTEMPT = 0.25
 REWARD_CHECK_ATTEMPT_PENALTY = -0.08
+REWARD_CHECK_REPEAT_PENALTY = -0.25
 
-REWARD_BLOCK_SUCCESS = 0.05
-REWARD_DEFENSE_FAIL = -0.01
-REWARD_ACCEPT_LOSS = -0.04
+REWARD_BLOCK_SUCCESS = 0.06
+REWARD_DEFENSE_FAIL = -0.03
+REWARD_ACCEPT_LOSS = -0.06
 
-REWARD_PARRY_SUCCESS = 0.18
-REWARD_PARRY_MOVE_GOOD = 0.30    # v8: 0.15 -> 0.30, incentivize offensive parry
+REWARD_PARRY_SUCCESS = 0.10
+REWARD_PARRY_MOVE_GOOD = 0.12
 REWARD_PARRY_SELF_CAPTURE = -1.50
-REWARD_PARRY_SKIP = -0.08        # v8: -0.03 -> -0.08, skip is not free
+REWARD_PARRY_SKIP = 0.00
 
 REWARD_STEP_PENALTY = -0.005
 
 # ── Capture quality bonus ──
-REWARD_CAPTURE_ATTACKER_BONUS = 0.02
+REWARD_CAPTURE_ATTACKER_BONUS = 0.03
 
 
 
@@ -100,6 +101,7 @@ def _progressive_draw_penalty(full_move_count: torch.Tensor, max_steps: int) -> 
 def reward_terminal(result_code: torch.Tensor, active_is_white: torch.Tensor,
                     board: torch.Tensor = None, piece_values: torch.Tensor = None,
                     full_move_count: torch.Tensor = None, max_steps: int = 150) -> torch.Tensor:
+    """Terminal reward from the ACTOR WHO JUST PLAYED perspective."""
     reward = torch.zeros_like(result_code, dtype=torch.float32)
 
     white_wins = result_code == 1

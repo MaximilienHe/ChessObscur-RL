@@ -43,13 +43,16 @@ class RolloutBuffer:
         self.rewards = torch.zeros(T, N, device=self.device)
         self.dones = torch.zeros(T, N, dtype=torch.bool, device=self.device)
         self.values = torch.zeros(T, N, device=self.device)
+        self.bootstrap_signs = torch.ones(T, N, device=self.device)
+        self.learn_masks = torch.ones(T, N, dtype=torch.bool, device=self.device)
         self.legal_masks_packed = torch.zeros(
             T, N, self.packed_mask_bytes, dtype=torch.uint8, device=self.device
         )
 
         self.step = 0
 
-    def insert(self, obs, actions, log_probs, rewards, dones, values, legal_masks):
+    def insert(self, obs, actions, log_probs, rewards, dones, values,
+               legal_masks, bootstrap_signs, learn_masks):
         t = self.step
         # v11: cast to storage dtype (float16 if enabled)
         self.obs[t] = obs.to(self.obs.dtype)
@@ -58,6 +61,8 @@ class RolloutBuffer:
         self.rewards[t] = rewards
         self.dones[t] = dones
         self.values[t] = values
+        self.bootstrap_signs[t] = bootstrap_signs
+        self.learn_masks[t] = learn_masks
         self.legal_masks_packed[t] = pack_action_mask(legal_masks)
         self.step += 1
 
@@ -71,6 +76,8 @@ class RolloutBuffer:
             "rewards": self.rewards,
             "dones": self.dones,
             "values": self.values,
+            "bootstrap_signs": self.bootstrap_signs,
+            "learn_masks": self.learn_masks,
             "legal_masks_packed": self.legal_masks_packed,
             "next_obs": next_obs,
         }
@@ -122,6 +129,8 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
     with torch.no_grad():
         for t in range(T):
             legal_mask = env.get_legal_mask()
+            actor_is_white = env.turn_is_white.clone()
+            learn_mask = torch.ones(env.N, dtype=torch.bool, device=_dev)
 
             phase_counts[0] += (env.phase == 0).sum()
             phase_counts[1] += (env.phase == 1).sum()
@@ -145,6 +154,7 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
 
                 if opp_envs.any():
                     opp_idx = opp_envs.nonzero(as_tuple=True)[0]
+                    learn_mask[opp_idx] = False
                     with torch.amp.autocast('cuda', enabled=use_amp):
                         opp_policy_logits, _ = opponent_net(obs[opp_idx], legal_mask[opp_idx])
                         opp_dist = torch.distributions.Categorical(logits=opp_policy_logits)
@@ -154,12 +164,20 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
             value = value.squeeze(-1)
 
             next_obs, reward, done, info = env.step(action)
+            next_actor_is_white = env.turn_is_white.clone()
+            bootstrap_signs = torch.where(
+                next_actor_is_white == actor_is_white,
+                torch.ones(env.N, device=_dev),
+                -torch.ones(env.N, device=_dev),
+            )
 
-            buffer.insert(obs, action, log_prob, reward, done, value, legal_mask)
+            buffer.insert(
+                obs, action, log_prob, reward, done, value,
+                legal_mask, bootstrap_signs, learn_mask
+            )
 
-            agent_w = env.agent_is_white
-            white_mask = agent_w
-            black_mask = ~agent_w
+            white_mask = actor_is_white
+            black_mask = ~actor_is_white
 
             white_reward_sum += reward[white_mask].sum()
             black_reward_sum += reward[black_mask].sum()

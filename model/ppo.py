@@ -32,7 +32,8 @@ class PPOTrainer:
         self._current_entropy_coef = config.entropy_coef
 
     def compute_gae(self, rewards: torch.Tensor, values: torch.Tensor,
-                    dones: torch.Tensor, next_value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                    dones: torch.Tensor, next_value: torch.Tensor,
+                    bootstrap_signs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         T, N = rewards.shape
         gamma = self.cfg.gamma
         lam = self.cfg.gae_lambda
@@ -47,8 +48,9 @@ class PPOTrainer:
                 next_val = values[t + 1]
 
             non_terminal = 1.0 - dones[t].float()
-            delta = rewards[t] + gamma * next_val * non_terminal - values[t]
-            last_gae = delta + gamma * lam * non_terminal * last_gae
+            signed_next_val = bootstrap_signs[t] * next_val
+            delta = rewards[t] + gamma * signed_next_val * non_terminal - values[t]
+            last_gae = delta + gamma * lam * bootstrap_signs[t] * non_terminal * last_gae
             advantages[t] = last_gae
 
         returns = advantages + values
@@ -76,7 +78,7 @@ class PPOTrainer:
 
         advantages, returns = self.compute_gae(
             rollout["rewards"], rollout["values"],
-            rollout["dones"], next_value
+            rollout["dones"], next_value, rollout["bootstrap_signs"]
         )
 
         T, N = rollout["rewards"].shape
@@ -88,7 +90,31 @@ class PPOTrainer:
         b_advantages = advantages.reshape(B)
         b_returns = returns.reshape(B)
         b_values = rollout["values"].reshape(B)
+        b_learn_masks = rollout["learn_masks"].reshape(B)
         b_legal_masks_packed = rollout["legal_masks_packed"].reshape(B, -1)
+
+        b_obs = b_obs[b_learn_masks]
+        b_actions = b_actions[b_learn_masks]
+        b_log_probs = b_log_probs[b_learn_masks]
+        b_advantages = b_advantages[b_learn_masks]
+        b_returns = b_returns[b_learn_masks]
+        b_values = b_values[b_learn_masks]
+        b_legal_masks_packed = b_legal_masks_packed[b_learn_masks]
+        B = b_actions.shape[0]
+
+        if b_actions.numel() == 0:
+            return {
+                "loss/policy": 0.0,
+                "loss/value": 0.0,
+                "loss/entropy": 0.0,
+                "ppo/clipfrac": 0.0,
+                "ppo/approx_kl": 0.0,
+                "ppo/entropy_coef": entropy_coef,
+                "returns/mean": 0.0,
+                "returns/std": 0.0,
+                "ppo/epochs_used": 0.0,
+                "ppo/kl_early_stopped": 0.0,
+            }
 
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 

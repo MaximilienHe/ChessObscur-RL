@@ -31,14 +31,14 @@ from env.move_tables import (
 )
 from env.reward import (
     reward_terminal,
-    REWARD_CAPTURE_SCALE, REWARD_LOSE_PIECE_SCALE,
+    REWARD_LOSE_PIECE_SCALE,
     REWARD_BLOCK_SUCCESS, REWARD_PARRY_SUCCESS,
     REWARD_DEFENSE_FAIL, REWARD_ACCEPT_LOSS, REWARD_PARRY_MOVE_GOOD,
     REWARD_PARRY_SKIP, REWARD_PARRY_SELF_CAPTURE,
     REWARD_STEP_PENALTY, REWARD_CHECK_ATTEMPT_PENALTY,
     REWARD_CAPTURE_ATTACKER_BONUS,
     REWARD_CHECK_ESCAPE_SUCCESS,
-    REWARD_CHECK_GIVEN, REWARD_CHECK_2ND_ATTEMPT
+    REWARD_CHECK_REPEAT_PENALTY,
 )
 
 PHASE_MOVE = 0
@@ -837,6 +837,7 @@ class ChessObscurEnv:
 
     def step(self, actions):
         N, dev = self.N, self.device
+        actor_is_white_before = self.turn_is_white.clone()
         reward = torch.full((N,), REWARD_STEP_PENALTY, device=dev)
         self._cached_move_legal_valid = False
 
@@ -886,7 +887,7 @@ class ChessObscurEnv:
             done_idx = done.nonzero(as_tuple=True)[0]
             reward[done_idx] += reward_terminal(
                 self.result[done_idx],
-                self.agent_is_white[done_idx],
+                actor_is_white_before[done_idx],
                 board=self.board[done_idx],
                 piece_values=self.tables.piece_values,
                 full_move_count=self.full_move_count[done_idx],
@@ -939,8 +940,6 @@ class ChessObscurEnv:
         fs = self.pending_attacker_sq[indices].long()
         ts = self.pending_target_sq[indices].long()
         aw = self.pending_attacker_color_white[indices]
-        agent_is_attacker = (aw == self.agent_is_white[indices])
-
         # ── Execute captures (outcome E) ──
         if outcome_E.any():
             ei = indices[outcome_E]
@@ -955,32 +954,30 @@ class ChessObscurEnv:
 
             edt = dt[outcome_E]
             dv = self.tables.piece_values[edt]
-            eat = at[outcome_E]
-            e_aia = agent_is_attacker[outcome_E]
             e_atk_stat = atk_stat[outcome_E]
             e_def_stat = def_stat[outcome_E]
 
-            reward[ei] += torch.where(e_aia,
-                                      REWARD_CAPTURE_SCALE * dv,
-                                      REWARD_LOSE_PIECE_SCALE * dv)
+            # Defense phase is viewed from the defender's perspective.
+            reward[ei] += REWARD_LOSE_PIECE_SCALE * dv
 
-            bonus_mask = e_aia & (e_atk_stat > e_def_stat)
+            bonus_mask = e_atk_stat > e_def_stat
             if bonus_mask.any():
                 bi = ei[bonus_mask]
-                reward[bi] += REWARD_CAPTURE_ATTACKER_BONUS * (e_atk_stat[bonus_mask] - e_def_stat[bonus_mask])
+                reward[bi] -= REWARD_CAPTURE_ATTACKER_BONUS * (
+                    e_atk_stat[bonus_mask] - e_def_stat[bonus_mask]
+                )
 
             e_accept = is_accept[outcome_E]
-            accept_non_atk = e_accept & ~e_aia
-            if accept_non_atk.any():
-                reward[ei[accept_non_atk]] += REWARD_ACCEPT_LOSS
-            fail_non_atk = ~e_accept & ~e_aia
-            if fail_non_atk.any():
-                reward[ei[fail_non_atk]] += REWARD_DEFENSE_FAIL
+            if e_accept.any():
+                reward[ei[e_accept]] += REWARD_ACCEPT_LOSS
+            fail_mask = ~e_accept
+            if fail_mask.any():
+                reward[ei[fail_mask]] += REWARD_DEFENSE_FAIL
 
             self.half_moves[ei] = 0
 
             # Stats (GPU accumulators — no sync)
-            self.capture_total_count += e_aia.sum()
+            self.capture_total_count += torch.tensor(ei.shape[0], dtype=torch.int64, device=dev)
             self.capture_high_attacker_count += bonus_mask.sum()
 
         # ── Block success (outcome B) ──
@@ -989,10 +986,7 @@ class ChessObscurEnv:
             baw = aw[outcome_B]
             self.turn_is_white[bi] = ~baw
             self.phase[bi] = PHASE_MOVE
-            b_aia = agent_is_attacker[outcome_B]
-            reward[bi] += torch.where(~b_aia,
-                                      torch.tensor(REWARD_BLOCK_SUCCESS, device=dev),
-                                      torch.tensor(-REWARD_BLOCK_SUCCESS * 0.5, device=dev))
+            reward[bi] += REWARD_BLOCK_SUCCESS
 
         # ── Parry success (outcome P) ──
         if outcome_P.any():
@@ -1003,10 +997,7 @@ class ChessObscurEnv:
             self.phase[pi] = PHASE_PARRY
             self.parry_square[pi] = pfs.short()
             self.parry_controller_is_white[pi] = ~paw
-            p_aia = agent_is_attacker[outcome_P]
-            reward[pi] += torch.where(~p_aia,
-                                      torch.tensor(REWARD_PARRY_SUCCESS, device=dev),
-                                      torch.tensor(-REWARD_PARRY_SUCCESS * 0.5, device=dev))
+            reward[pi] += REWARD_PARRY_SUCCESS
 
         # Clear pending
         self.pending_attacker_sq[indices] = -1
@@ -1288,18 +1279,12 @@ class ChessObscurEnv:
             self.check_attempts[ci, aci] += 1
             new_attempts = self.check_attempts[ci, aci]
 
-            agent_is_actor = (actor_w[check_mask] == self.agent_is_white[ci])
-            agent_is_checker = ~agent_is_actor
-
-            # Penalty for being in check / reward for giving check
-            reward[ci] += torch.where(agent_is_actor,
-                                      torch.tensor(REWARD_CHECK_ATTEMPT_PENALTY, device=dev),
-                                      torch.tensor(REWARD_CHECK_GIVEN, device=dev))
+            # Reward is expressed from the current actor's perspective.
+            reward[ci] += REWARD_CHECK_ATTEMPT_PENALTY
 
             second_plus = new_attempts >= 2
-            bonus = agent_is_checker & second_plus
-            if bonus.any():
-                reward[ci[bonus]] += REWARD_CHECK_2ND_ATTEMPT
+            if second_plus.any():
+                reward[ci[second_plus]] += REWARD_CHECK_REPEAT_PENALTY
 
             # Turn back to actor to escape check
             self.turn_is_white[ci] = actor_w[check_mask]
@@ -1328,11 +1313,9 @@ class ChessObscurEnv:
 
             # Escape reward
             was_in_check = old_attempts > 0
-            agent_is_actor_nc = (actor_w[no_check] == self.agent_is_white[ni])
-            give_escape = was_in_check & agent_is_actor_nc
-            if give_escape.any():
-                ei = ni[give_escape]
-                urgency = old_attempts[give_escape].float().clamp(max=2)
+            if was_in_check.any():
+                ei = ni[was_in_check]
+                urgency = old_attempts[was_in_check].float().clamp(max=2)
                 reward[ei] += REWARD_CHECK_ESCAPE_SUCCESS * urgency
 
     # ══════════════════════════════════════════════
