@@ -1,6 +1,13 @@
 """
 chess_obscur_env.py — Fully vectorized GPU Chess Obscur environment.
 
+CHANGES v11 (frame stacking + attack planes + move number + MCTS support):
+  NEW:  Frame stacking — board_history ring buffer stores last N board states.
+  NEW:  X-ray attack planes (friendly/enemy) computed via matrix multiply.
+  NEW:  Move number plane for game-phase awareness (opening vs endgame).
+  NEW:  snapshot() / restore() for MCTS tree search simulation.
+  PERF: Attack planes use precomputed diag/straight masks (matmul, no loops).
+
 CHANGES v9 (performance + correctness overhaul):
   PERF: Vectorized _resolve_defense, _apply_board_moves, _enforce_check —
         eliminated all per-env Python loops and .item() GPU syncs in step().
@@ -52,15 +59,22 @@ MAX_ZOBRIST_HISTORY = 400
 
 
 class ChessObscurEnv:
-    def __init__(self, num_envs: int, device: str = "cuda", max_steps: int = 150):
+    def __init__(self, num_envs: int, device: str = "cuda", max_steps: int = 150,
+                 frame_stack: int = 4):
         self.N = num_envs
         self.device = torch.device(device)
         self.max_steps = max_steps
+        self.frame_stack = frame_stack
         self.tables = MoveTables(device)
         self._precompute_attack_tables()
         self._precompute_zobrist()
 
         dev = self.device
+
+        # v11: board history ring buffer for frame stacking (stored as int8, very compact)
+        self.board_history = torch.zeros(num_envs, frame_stack, 64, dtype=torch.int8, device=dev)
+        self._hist_idx = 0  # circular write index (avoids torch.roll allocation)
+
         self.board = torch.zeros(num_envs, 64, dtype=torch.int8, device=dev)
         self.turn_is_white = torch.ones(num_envs, dtype=torch.bool, device=dev)
         self.phase = torch.zeros(num_envs, dtype=torch.int8, device=dev)
@@ -86,21 +100,21 @@ class ChessObscurEnv:
         self._cached_move_legal_mask = torch.zeros(num_envs, 4096, dtype=torch.bool, device=dev)
         self._cached_move_legal_valid = False
 
-        # ── Parry outcome counters ──
-        self.parry_self_capture_count = 0
-        self.parry_good_move_count = 0
-        self.parry_skip_count = 0
-        self.parry_total_count = 0
+        # ── Parry outcome counters (GPU tensors to avoid sync) ──
+        self.parry_self_capture_count = torch.zeros((), dtype=torch.int64, device=dev)
+        self.parry_good_move_count = torch.zeros((), dtype=torch.int64, device=dev)
+        self.parry_skip_count = torch.zeros((), dtype=torch.int64, device=dev)
+        self.parry_total_count = torch.zeros((), dtype=torch.int64, device=dev)
 
-        # ── Capture quality stats ──
-        self.capture_total_count = 0
-        self.capture_high_attacker_count = 0
+        # ── Capture quality stats (GPU tensors to avoid sync) ──
+        self.capture_total_count = torch.zeros((), dtype=torch.int64, device=dev)
+        self.capture_high_attacker_count = torch.zeros((), dtype=torch.int64, device=dev)
 
-        # ── Check escape stats ──
-        self.check_escape_by_move_count = 0
-        self.check_escape_by_capture_count = 0
-        self.check_3rd_attempt_capture_count = 0
-        self.check_3rd_attempt_move_count = 0
+        # ── Check escape stats (GPU tensors to avoid sync) ──
+        self.check_escape_by_move_count = torch.zeros((), dtype=torch.int64, device=dev)
+        self.check_escape_by_capture_count = torch.zeros((), dtype=torch.int64, device=dev)
+        self.check_3rd_attempt_capture_count = torch.zeros((), dtype=torch.int64, device=dev)
+        self.check_3rd_attempt_move_count = torch.zeros((), dtype=torch.int64, device=dev)
 
         self.reset()
 
@@ -150,6 +164,14 @@ class ChessObscurEnv:
                     for b in ray_sqs[:idx_t]:
                         self.between_mask[sq, target, b] = True
 
+        # v11: precompute float versions for x-ray attack plane matmul
+        self.knight_attack_f = self.knight_attack_table.float()  # (64, 64)
+        self.king_attack_f = self.king_attack_table.float()      # (64, 64)
+        self.w_pawn_attack_f = self.w_pawn_attack_table.float()  # (64, 64)
+        self.b_pawn_attack_f = self.b_pawn_attack_table.float()  # (64, 64)
+        self.diag_attack_f = (self.ray_aligned & (self.ray_type == 1)).float()  # (64, 64)
+        self.straight_attack_f = (self.ray_aligned & (self.ray_type == 2)).float()  # (64, 64)
+
     def _precompute_zobrist(self):
         """Precompute Zobrist hash table for threefold repetition detection."""
         gen = torch.Generator(device="cpu")
@@ -176,11 +198,12 @@ class ChessObscurEnv:
     #  RESET
     # ══════════════════════════════════════════════
 
-    def reset(self, mask=None):
+    def reset(self, mask=None, _skip_obs: bool = False):
         if mask is None:
             mask = torch.ones(self.N, dtype=torch.bool, device=self.device)
         n = mask.sum().item()
-        if n == 0: return self._build_obs()
+        if n == 0:
+            return None if _skip_obs else self._build_obs()
         dev = self.device
         init = torch.zeros(n, 64, dtype=torch.int8, device=dev)
         bw = torch.tensor([W_ROOK,W_KNIGHT,W_BISHOP,W_QUEEN,W_KING,W_BISHOP,W_KNIGHT,W_ROOK], dtype=torch.int8, device=dev)
@@ -196,6 +219,8 @@ class ChessObscurEnv:
         self.pending_attacker_color_white[mask] = False
         self.parry_controller_is_white[mask] = False
         self.agent_is_white[mask] = torch.rand(n, device=dev) > 0.5
+        # v11: fill all history frames with the initial board
+        self.board_history[mask] = self.board[mask].unsqueeze(1).expand(-1, self.frame_stack, -1)
         # v9: reset zobrist history and record the starting position.
         self.zobrist_history[mask] = 0
         self.zobrist_len[mask] = 0
@@ -203,6 +228,8 @@ class ChessObscurEnv:
         self._update_zobrist(reset_idx)
         if self._cached_move_legal_valid:
             self._cached_move_legal_mask[reset_idx] = self._compute_move_legal_mask(reset_idx)
+        if _skip_obs:
+            return None
         return self._build_obs()
 
     def set_max_steps(self, new_max_steps: int):
@@ -210,37 +237,37 @@ class ChessObscurEnv:
 
     def get_and_reset_parry_stats(self):
         stats = {
-            "parry/total": self.parry_total_count,
-            "parry/self_capture": self.parry_self_capture_count,
-            "parry/good_move": self.parry_good_move_count,
-            "parry/skip": self.parry_skip_count,
+            "parry/total": self.parry_total_count.item(),
+            "parry/self_capture": self.parry_self_capture_count.item(),
+            "parry/good_move": self.parry_good_move_count.item(),
+            "parry/skip": self.parry_skip_count.item(),
         }
-        self.parry_total_count = 0
-        self.parry_self_capture_count = 0
-        self.parry_good_move_count = 0
-        self.parry_skip_count = 0
+        self.parry_total_count.zero_()
+        self.parry_self_capture_count.zero_()
+        self.parry_good_move_count.zero_()
+        self.parry_skip_count.zero_()
         return stats
 
     def get_and_reset_capture_stats(self):
         stats = {
-            "capture/total": self.capture_total_count,
-            "capture/high_attacker": self.capture_high_attacker_count,
+            "capture/total": self.capture_total_count.item(),
+            "capture/high_attacker": self.capture_high_attacker_count.item(),
         }
-        self.capture_total_count = 0
-        self.capture_high_attacker_count = 0
+        self.capture_total_count.zero_()
+        self.capture_high_attacker_count.zero_()
         return stats
 
     def get_and_reset_check_stats(self):
         stats = {
-            "check/escape_by_move": self.check_escape_by_move_count,
-            "check/escape_by_capture": self.check_escape_by_capture_count,
-            "check/3rd_attempt_capture": self.check_3rd_attempt_capture_count,
-            "check/3rd_attempt_move": self.check_3rd_attempt_move_count,
+            "check/escape_by_move": self.check_escape_by_move_count.item(),
+            "check/escape_by_capture": self.check_escape_by_capture_count.item(),
+            "check/3rd_attempt_capture": self.check_3rd_attempt_capture_count.item(),
+            "check/3rd_attempt_move": self.check_3rd_attempt_move_count.item(),
         }
-        self.check_escape_by_move_count = 0
-        self.check_escape_by_capture_count = 0
-        self.check_3rd_attempt_capture_count = 0
-        self.check_3rd_attempt_move_count = 0
+        self.check_escape_by_move_count.zero_()
+        self.check_escape_by_capture_count.zero_()
+        self.check_3rd_attempt_capture_count.zero_()
+        self.check_3rd_attempt_move_count.zero_()
         return stats
 
     # ══════════════════════════════════════════════
@@ -323,36 +350,88 @@ class ChessObscurEnv:
 
     def _build_obs(self):
         N, dev = self.N, self.device
-        obs = torch.zeros(N, 19, 8, 8, device=dev)
-        board = self.board
-        is_w = self.turn_is_white.view(N, 1, 1).float()
+        F = self.frame_stack
+        P = 12  # piece planes per frame
+        M = 7   # metadata planes
+        E = 3   # extra planes (attacks + move number)
+        total_planes = P * F + M + E
+        obs = torch.zeros(N, total_planes, 8, 8, device=dev)
 
-        # v9: batched piece plane computation (2 comparisons instead of 12)
-        pieces = board.unsqueeze(1)  # (N, 1, 64)
-        w_pieces = torch.arange(1, 7, device=dev).view(1, 6, 1)
-        b_pieces = torch.arange(7, 13, device=dev).view(1, 6, 1)
-        w_mask = (pieces == w_pieces).float().view(N, 6, 8, 8)
-        b_mask = (pieces == b_pieces).float().view(N, 6, 8, 8)
-        is_w_4d = is_w.unsqueeze(1)
-        obs[:, :6] = w_mask * is_w_4d + b_mask * (1 - is_w_4d)
-        obs[:, 6:12] = b_mask * is_w_4d + w_mask * (1 - is_w_4d)
+        is_w = self.turn_is_white  # (N,)
+        is_w_f = is_w.float().view(N, 1, 1)
+        is_w_4d = is_w_f.unsqueeze(1)
+
+        # v11: stacked piece planes from board_history — fully vectorized (no Python loop)
+        # Reorder history so oldest frame comes first (circular buffer order)
+        idx_order = [(self._hist_idx + t) % F for t in range(F)]
+        hist = self.board_history[:, idx_order]         # (N, F, 64)
+        pieces = hist.unsqueeze(2)                      # (N, F, 1, 64)
+        w_pieces = torch.arange(1, 7, device=dev).view(1, 1, 6, 1)
+        b_pieces = torch.arange(7, 13, device=dev).view(1, 1, 6, 1)
+        w_mask = (pieces == w_pieces).float().view(N, F, 6, 8, 8)  # (N, F, 6, 8, 8)
+        b_mask = (pieces == b_pieces).float().view(N, F, 6, 8, 8)
+        is_w_5d = is_w.float().view(N, 1, 1, 1, 1)
+        friendly = (w_mask * is_w_5d + b_mask * (1 - is_w_5d))     # (N, F, 6, 8, 8)
+        enemy = (b_mask * is_w_5d + w_mask * (1 - is_w_5d))
+        # Interleave friendly/enemy into (N, F, 12, 8, 8) then flatten to (N, F*12, 8, 8)
+        stacked = torch.cat([friendly, enemy], dim=2)               # (N, F, 12, 8, 8)
+        obs[:, :F * P] = stacked.view(N, F * P, 8, 8)
+
+        # ── Metadata planes (same as before, at offset P*F) ──
+        off = P * F
 
         ep = self.en_passant; ev = ep >= 0
         if ev.any():
             ef = torch.zeros(N, 64, device=dev)
             ef.scatter_(1, ep.long().clamp(0, 63).unsqueeze(1), ev.float().unsqueeze(1))
-            obs[:, 12] = ef.view(N, 8, 8)
+            obs[:, off] = ef.view(N, 8, 8)
+
         c = self.castling.float(); iw = self.turn_is_white.float()
-        obs[:, 13, 0, :] = (c[:, 0]*iw+c[:, 2]*(1-iw)).unsqueeze(1).expand(-1, 8)
-        obs[:, 13, 1, :] = (c[:, 1]*iw+c[:, 3]*(1-iw)).unsqueeze(1).expand(-1, 8)
-        obs[:, 13, 2, :] = (c[:, 2]*iw+c[:, 0]*(1-iw)).unsqueeze(1).expand(-1, 8)
-        obs[:, 13, 3, :] = (c[:, 3]*iw+c[:, 1]*(1-iw)).unsqueeze(1).expand(-1, 8)
-        obs[:, 14] = self.turn_is_white.float().view(N, 1, 1).expand(-1, 8, 8)
-        obs[:, 15] = self._is_in_check_batched(self.board, self.turn_is_white).float().view(N, 1, 1).expand(-1, 8, 8)
-        obs[:, 16] = (self.phase.float()/3).view(N, 1, 1).expand(-1, 8, 8)
+        obs[:, off+1, 0, :] = (c[:, 0]*iw+c[:, 2]*(1-iw)).unsqueeze(1).expand(-1, 8)
+        obs[:, off+1, 1, :] = (c[:, 1]*iw+c[:, 3]*(1-iw)).unsqueeze(1).expand(-1, 8)
+        obs[:, off+1, 2, :] = (c[:, 2]*iw+c[:, 0]*(1-iw)).unsqueeze(1).expand(-1, 8)
+        obs[:, off+1, 3, :] = (c[:, 3]*iw+c[:, 1]*(1-iw)).unsqueeze(1).expand(-1, 8)
+        obs[:, off+2] = is_w_f.expand(-1, 8, 8)
+        obs[:, off+3] = self._is_in_check_batched(self.board, is_w).float().view(N, 1, 1).expand(-1, 8, 8)
+        obs[:, off+4] = (self.phase.float()/3).view(N, 1, 1).expand(-1, 8, 8)
         ca = self.check_attempts
-        obs[:, 17] = torch.where(self.turn_is_white, ca[:, 0], ca[:, 1]).float().div(3).view(N, 1, 1).expand(-1, 8, 8)
-        obs[:, 18] = (self.half_moves.float()/100).view(N, 1, 1).expand(-1, 8, 8)
+        obs[:, off+5] = torch.where(is_w, ca[:, 0], ca[:, 1]).float().div(3).view(N, 1, 1).expand(-1, 8, 8)
+        obs[:, off+6] = (self.half_moves.float()/100).view(N, 1, 1).expand(-1, 8, 8)
+
+        # ── v11: extra planes ──
+        eoff = off + M
+
+        # X-ray attack maps (approximate: ignores blocking for sliding pieces)
+        # Uses matmul: piece_positions @ attack_table → attacked squares
+        board = self.board
+        w_p = (board == W_PAWN).float()   # (N, 64)
+        b_p = (board == B_PAWN).float()
+        w_n = (board == W_KNIGHT).float()
+        b_n = (board == B_KNIGHT).float()
+        w_b = ((board == W_BISHOP) | (board == W_QUEEN)).float()
+        b_b = ((board == B_BISHOP) | (board == B_QUEEN)).float()
+        w_r = ((board == W_ROOK) | (board == W_QUEEN)).float()
+        b_r = ((board == B_ROOK) | (board == B_QUEEN)).float()
+        w_k = (board == W_KING).float()
+        b_k = (board == B_KING).float()
+
+        w_atk = (w_p @ self.w_pawn_attack_f + w_n @ self.knight_attack_f +
+                 w_b @ self.diag_attack_f + w_r @ self.straight_attack_f +
+                 w_k @ self.king_attack_f).clamp(max=1.0)
+        b_atk = (b_p @ self.b_pawn_attack_f + b_n @ self.knight_attack_f +
+                 b_b @ self.diag_attack_f + b_r @ self.straight_attack_f +
+                 b_k @ self.king_attack_f).clamp(max=1.0)
+
+        # Canonicalize: plane eoff+0 = friendly attacks, eoff+1 = enemy attacks
+        is_w_64 = is_w.float().unsqueeze(1)  # (N, 1)
+        friendly_atk = (w_atk * is_w_64 + b_atk * (1 - is_w_64)).view(N, 8, 8)
+        enemy_atk = (b_atk * is_w_64 + w_atk * (1 - is_w_64)).view(N, 8, 8)
+        obs[:, eoff] = friendly_atk
+        obs[:, eoff+1] = enemy_atk
+
+        # Move number (normalized by curriculum cap)
+        obs[:, eoff+2] = (self.full_move_count.float() / (self.max_steps * 2)).clamp(max=1.0).view(N, 1, 1).expand(-1, 8, 8)
+
         return obs
 
     # ══════════════════════════════════════════════
@@ -813,7 +892,11 @@ class ChessObscurEnv:
                 full_move_count=self.full_move_count[done_idx],
                 max_steps=self.max_steps
             )
-            self.reset(done)
+            self.reset(done, _skip_obs=True)
+
+        # v11: push current board into history ring buffer (circular, zero-alloc)
+        self.board_history[:, self._hist_idx] = self.board
+        self._hist_idx = (self._hist_idx + 1) % self.frame_stack
 
         return self._build_obs(), reward, done, info
 
@@ -896,9 +979,9 @@ class ChessObscurEnv:
 
             self.half_moves[ei] = 0
 
-            # Stats
-            self.capture_total_count += e_aia.sum().item()
-            self.capture_high_attacker_count += bonus_mask.sum().item()
+            # Stats (GPU accumulators — no sync)
+            self.capture_total_count += e_aia.sum()
+            self.capture_high_attacker_count += bonus_mask.sum()
 
         # ── Block success (outcome B) ──
         if outcome_B.any():
@@ -992,11 +1075,11 @@ class ChessObscurEnv:
         if is_in_check.any():
             chk_cap = is_in_check & is_capture
             chk_mov = is_in_check & ~is_capture
-            self.check_escape_by_capture_count += chk_cap.sum().item()
-            self.check_escape_by_move_count += chk_mov.sum().item()
+            self.check_escape_by_capture_count += chk_cap.sum()
+            self.check_escape_by_move_count += chk_mov.sum()
             chk_3rd = is_in_check & (current_ca >= 2)
-            self.check_3rd_attempt_capture_count += (chk_3rd & is_capture).sum().item()
-            self.check_3rd_attempt_move_count += (chk_3rd & ~is_capture).sum().item()
+            self.check_3rd_attempt_capture_count += (chk_3rd & is_capture).sum()
+            self.check_3rd_attempt_move_count += (chk_3rd & ~is_capture).sum()
 
         # ── Start defense for captures ──
         cap_mask = is_capture
@@ -1087,15 +1170,11 @@ class ChessObscurEnv:
         is_capture = (tgt != EMPTY) & ~is_skip
         is_good = ~is_skip & ~is_capture
 
-        # Stats (batched)
-        n_skip = is_skip.sum().item()
-        n_capture = is_capture.sum().item()
-        n_good = is_good.sum().item()
-        n_total = n_skip + n_capture + n_good
-        self.parry_skip_count += n_skip
-        self.parry_self_capture_count += n_capture
-        self.parry_good_move_count += n_good
-        self.parry_total_count += n_total
+        # Stats (GPU accumulators — no sync)
+        self.parry_skip_count += is_skip.sum()
+        self.parry_self_capture_count += is_capture.sum()
+        self.parry_good_move_count += is_good.sum()
+        self.parry_total_count += M
 
         # ── Skip ──
         if is_skip.any():
@@ -1285,3 +1364,58 @@ class ChessObscurEnv:
                 torch.where(iw, torch.tensor(RESULT_BLACK_WIN, dtype=torch.int8, device=self.device),
                                  torch.tensor(RESULT_WHITE_WIN, dtype=torch.int8, device=self.device)),
                 torch.tensor(RESULT_DRAW, dtype=torch.int8, device=self.device))
+
+    # ══════════════════════════════════════════════
+    #  SNAPSHOT / RESTORE (v11: for MCTS tree search)
+    # ══════════════════════════════════════════════
+
+    def snapshot(self, env_idx: int) -> Dict[str, torch.Tensor]:
+        """Save all mutable state for a single env. Used by MCTS to simulate moves."""
+        i = env_idx
+        return {
+            "board": self.board[i].clone(),
+            "board_history": self.board_history[i].clone(),
+            "turn_is_white": self.turn_is_white[i].clone(),
+            "phase": self.phase[i].clone(),
+            "result": self.result[i].clone(),
+            "castling": self.castling[i].clone(),
+            "en_passant": self.en_passant[i].clone(),
+            "check_attempts": self.check_attempts[i].clone(),
+            "half_moves": self.half_moves[i].clone(),
+            "full_move_count": self.full_move_count[i].clone(),
+            "pending_attacker_sq": self.pending_attacker_sq[i].clone(),
+            "pending_target_sq": self.pending_target_sq[i].clone(),
+            "pending_attacker_piece": self.pending_attacker_piece[i].clone(),
+            "pending_defender_piece": self.pending_defender_piece[i].clone(),
+            "pending_attacker_color_white": self.pending_attacker_color_white[i].clone(),
+            "parry_square": self.parry_square[i].clone(),
+            "parry_controller_is_white": self.parry_controller_is_white[i].clone(),
+            "agent_is_white": self.agent_is_white[i].clone(),
+            "zobrist_history": self.zobrist_history[i].clone(),
+            "zobrist_len": self.zobrist_len[i].clone(),
+        }
+
+    def restore(self, env_idx: int, snap: Dict[str, torch.Tensor]):
+        """Restore all mutable state for a single env from a snapshot."""
+        i = env_idx
+        self.board[i] = snap["board"]
+        self.board_history[i] = snap["board_history"]
+        self.turn_is_white[i] = snap["turn_is_white"]
+        self.phase[i] = snap["phase"]
+        self.result[i] = snap["result"]
+        self.castling[i] = snap["castling"]
+        self.en_passant[i] = snap["en_passant"]
+        self.check_attempts[i] = snap["check_attempts"]
+        self.half_moves[i] = snap["half_moves"]
+        self.full_move_count[i] = snap["full_move_count"]
+        self.pending_attacker_sq[i] = snap["pending_attacker_sq"]
+        self.pending_target_sq[i] = snap["pending_target_sq"]
+        self.pending_attacker_piece[i] = snap["pending_attacker_piece"]
+        self.pending_defender_piece[i] = snap["pending_defender_piece"]
+        self.pending_attacker_color_white[i] = snap["pending_attacker_color_white"]
+        self.parry_square[i] = snap["parry_square"]
+        self.parry_controller_is_white[i] = snap["parry_controller_is_white"]
+        self.agent_is_white[i] = snap["agent_is_white"]
+        self.zobrist_history[i] = snap["zobrist_history"]
+        self.zobrist_len[i] = snap["zobrist_len"]
+        self._cached_move_legal_valid = False

@@ -188,30 +188,48 @@ def board_js_to_tensor(board_js: list) -> torch.Tensor:
     return t
 
 
-def build_obs_from_request(req: MoveRequest) -> torch.Tensor:
-    """Construit l'observation (1, 19, 8, 8) à partir de la requête."""
+def build_obs_from_request(req: MoveRequest, frame_stack: int = 4) -> torch.Tensor:
+    """Construit l'observation (1, obs_planes, 8, 8) à partir de la requête.
+
+    v11: produces frame-stacked obs with attack planes and move number.
+    Since the server has no frame history, all history slots are filled with the
+    current board. The network still benefits from the attack/move-number planes.
+    """
     board = board_js_to_tensor(req.board)
     is_white = (req.turn == "w")
 
-    obs = torch.zeros(19, 8, 8)
+    P = 12  # piece planes per frame
+    M = 7   # metadata planes
+    E = 3   # extra planes (attacks + move number)
+    total_planes = P * frame_stack + M + E
+    obs = torch.zeros(total_planes, 8, 8)
 
+    # Build piece planes for current board (used for all history frames)
+    piece_planes = torch.zeros(12, 8, 8)
     for pt in range(6):
         w_code = pt + 1
         b_code = pt + 7
         w_mask = (board == w_code).float().view(8, 8)
         b_mask = (board == b_code).float().view(8, 8)
         if is_white:
-            obs[pt] = w_mask
-            obs[6 + pt] = b_mask
+            piece_planes[pt] = w_mask
+            piece_planes[6 + pt] = b_mask
         else:
-            obs[pt] = b_mask
-            obs[6 + pt] = w_mask
+            piece_planes[pt] = b_mask
+            piece_planes[6 + pt] = w_mask
+
+    # Fill all frame_stack slots with the same piece planes (no history in server)
+    for t in range(frame_stack):
+        obs[t * P:(t + 1) * P] = piece_planes
+
+    # ── Metadata planes ──
+    off = P * frame_stack
 
     # En passant
     ep = req.enPassant
     if ep is not None and 0 <= ep < 64:
         r, f = ep // 8, ep % 8
-        obs[12, r, f] = 1.0
+        obs[off, r, f] = 1.0
 
     # Castling
     c = req.castling
@@ -220,30 +238,96 @@ def build_obs_from_request(req: MoveRequest) -> torch.Tensor:
     bK = float(c.get("bK", False))
     bQ = float(c.get("bQ", False))
     if is_white:
-        obs[13, 0, :] = wK; obs[13, 1, :] = wQ
-        obs[13, 2, :] = bK; obs[13, 3, :] = bQ
+        obs[off+1, 0, :] = wK; obs[off+1, 1, :] = wQ
+        obs[off+1, 2, :] = bK; obs[off+1, 3, :] = bQ
     else:
-        obs[13, 0, :] = bK; obs[13, 1, :] = bQ
-        obs[13, 2, :] = wK; obs[13, 3, :] = wQ
+        obs[off+1, 0, :] = bK; obs[off+1, 1, :] = bQ
+        obs[off+1, 2, :] = wK; obs[off+1, 3, :] = wQ
 
     # Turn
-    obs[14] = 1.0 if is_white else 0.0
+    obs[off+2] = 1.0 if is_white else 0.0
 
-    # In-check plane (side to move).
-    obs[15] = 1.0 if _is_in_check(board, is_white) else 0.0
+    # In-check
+    obs[off+3] = 1.0 if _is_in_check(board, is_white) else 0.0
 
     # Phase
     phase_map = {"move": 0, "defense": 1, "parry_move": 2}
-    obs[16] = phase_map.get(req.phase, 0) / 3.0
+    obs[off+4] = phase_map.get(req.phase, 0) / 3.0
 
     # Check attempts
     ca = req.checkAttempts.get(req.turn, 0)
-    obs[17] = ca / 3.0
+    obs[off+5] = ca / 3.0
 
     # Half-move clock
-    obs[18] = min(req.halfMoves / 100.0, 1.0)
+    obs[off+6] = min(req.halfMoves / 100.0, 1.0)
 
-    return obs.unsqueeze(0)  # (1, 19, 8, 8)
+    # ── Extra planes (v11) ──
+    eoff = off + M
+
+    # Approximate attack planes (x-ray, no blocking for sliding pieces)
+    # Simplified scalar version for single-board inference
+    w_attacks = torch.zeros(64)
+    b_attacks = torch.zeros(64)
+    for sq in range(64):
+        piece = int(board[sq].item())
+        if piece == 0:
+            continue
+        is_w_piece = 1 <= piece <= 6
+        pt_val = piece - 1 if is_w_piece else piece - 7
+        target = w_attacks if is_w_piece else b_attacks
+
+        if pt_val == 0:  # pawn
+            f_idx, r_idx = sq % 8, sq // 8
+            if is_w_piece:
+                for df in (-1, 1):
+                    nf = f_idx + df
+                    if 0 <= nf < 8 and r_idx + 1 < 8:
+                        target[nf + (r_idx + 1) * 8] = 1.0
+            else:
+                for df in (-1, 1):
+                    nf = f_idx + df
+                    if 0 <= nf < 8 and r_idx - 1 >= 0:
+                        target[nf + (r_idx - 1) * 8] = 1.0
+        elif pt_val == 1:  # knight
+            f_idx, r_idx = sq % 8, sq // 8
+            for df, dr in [(1,2),(2,1),(2,-1),(1,-2),(-1,-2),(-2,-1),(-2,1),(-1,2)]:
+                nf, nr = f_idx + df, r_idx + dr
+                if 0 <= nf < 8 and 0 <= nr < 8:
+                    target[nf + nr * 8] = 1.0
+        elif pt_val == 5:  # king
+            f_idx, r_idx = sq % 8, sq // 8
+            for df in (-1, 0, 1):
+                for dr in (-1, 0, 1):
+                    if df == 0 and dr == 0:
+                        continue
+                    nf, nr = f_idx + df, r_idx + dr
+                    if 0 <= nf < 8 and 0 <= nr < 8:
+                        target[nf + nr * 8] = 1.0
+        else:  # sliding pieces (bishop=2, rook=3, queen=4)
+            f_idx, r_idx = sq % 8, sq // 8
+            dirs = []
+            if pt_val in (2, 4):  # bishop or queen: diagonals
+                dirs += [(1,1),(1,-1),(-1,1),(-1,-1)]
+            if pt_val in (3, 4):  # rook or queen: straights
+                dirs += [(1,0),(-1,0),(0,1),(0,-1)]
+            for df, dr in dirs:
+                nf, nr = f_idx + df, r_idx + dr
+                while 0 <= nf < 8 and 0 <= nr < 8:
+                    target[nf + nr * 8] = 1.0
+                    nf += df
+                    nr += dr
+
+    if is_white:
+        obs[eoff] = w_attacks.view(8, 8)
+        obs[eoff+1] = b_attacks.view(8, 8)
+    else:
+        obs[eoff] = b_attacks.view(8, 8)
+        obs[eoff+1] = w_attacks.view(8, 8)
+
+    # Move number (normalized — use halfMoves as proxy since we don't have full_move_count)
+    obs[eoff+2] = min(req.halfMoves / 200.0, 1.0)
+
+    return obs.unsqueeze(0)  # (1, total_planes, 8, 8)
 
 
 def build_legal_mask_from_request(req: MoveRequest) -> torch.Tensor:
@@ -332,6 +416,7 @@ app = FastAPI(title="Chess Obscur AI")
 model: ChessObscurNetwork = None
 device: torch.device = None
 temperature: float = 0.5
+server_cfg: Config = None  # v11: store config for frame_stack inference
 
 
 def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor], cfg: Config) -> None:
@@ -353,6 +438,13 @@ def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor], cfg: Config
     if "value_fc.0.weight" in state_dict:
         cfg.value_head_hidden = int(state_dict["value_fc.0.weight"].shape[0])
 
+    # v11: infer value head channels
+    if "value_conv.0.weight" in state_dict:
+        cfg.value_head_channels = int(state_dict["value_conv.0.weight"].shape[0])
+
+    # v11: detect attention layer
+    cfg.use_attention = "attention.attn.in_proj_weight" in state_dict
+
     res_block_indices = []
     for key in state_dict.keys():
         if key.startswith("res_blocks."):
@@ -362,13 +454,19 @@ def _infer_arch_from_state_dict(state_dict: Dict[str, torch.Tensor], cfg: Config
     if res_block_indices:
         cfg.num_res_blocks = max(res_block_indices) + 1
 
+    # v11: infer frame_stack from obs_planes
+    # obs_planes = 12 * frame_stack + 7 + 3 => frame_stack = (obs_planes - 10) / 12
+    inferred_fs = (cfg.obs_planes - cfg.meta_planes - cfg.extra_planes) // cfg.piece_planes
+    if inferred_fs >= 1:
+        cfg.frame_stack = inferred_fs
+
 
 def load_model(checkpoint_path: str, dev: str = "cpu",
                value_head_hidden: Optional[int] = None,
                num_res_blocks: Optional[int] = None,
                num_filters: Optional[int] = None,
                policy_head_filters: Optional[int] = None):
-    global model, device
+    global model, device, server_cfg
     device = torch.device(dev)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     new_state_dict, _, migration = prepare_model_state_dict(ckpt)
@@ -393,10 +491,15 @@ def load_model(checkpoint_path: str, dev: str = "cpu",
         policy_head_filters=cfg.policy_head_filters,
         value_head_hidden=cfg.value_head_hidden,
         total_actions=cfg.total_actions,
+        value_head_channels=cfg.value_head_channels,
+        use_attention=cfg.use_attention,
+        attention_heads=cfg.attention_heads,
     ).to(device)
 
-    model.load_state_dict(new_state_dict)
+    strict = not migration.get("attention", False)
+    model.load_state_dict(new_state_dict, strict=strict)
     model.eval()
+    server_cfg = cfg
     print(f"[ai] Modèle chargé: {checkpoint_path} sur {device}")
     if migration["action_head"]:
         print("[ai] Checkpoint legacy adapte automatiquement de 4163 a 4099 actions")
@@ -404,7 +507,8 @@ def load_model(checkpoint_path: str, dev: str = "cpu",
         print("[ai] Checkpoint legacy adapte automatiquement le value head de 1 a 4 canaux")
     print(
         f"[ai] Arch: num_filters={cfg.num_filters}, num_res_blocks={cfg.num_res_blocks}, "
-        f"policy_head_filters={cfg.policy_head_filters}, value_head_hidden={cfg.value_head_hidden}"
+        f"policy_head_filters={cfg.policy_head_filters}, value_head_hidden={cfg.value_head_hidden}, "
+        f"obs_planes={cfg.obs_planes}, attention={'ON' if cfg.use_attention else 'OFF'}"
     )
 
 
@@ -420,10 +524,11 @@ def health():
 @app.post("/move", response_model=MoveResponse)
 def get_move(req: MoveRequest):
     """Retourne le meilleur coup selon le modèle."""
-    obs = build_obs_from_request(req).to(device)
+    fs = server_cfg.frame_stack if server_cfg is not None else 4
+    obs = build_obs_from_request(req, frame_stack=fs).to(device)
     legal_mask = build_legal_mask_from_request(req).to(device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         policy_logits, value = model(obs, legal_mask)
 
         # True greedy mode for temperature <= 0

@@ -1,5 +1,10 @@
 """
 ppo.py — Proximal Policy Optimization for Chess Obscur.
+
+CHANGES v11:
+- KL early stopping: if approx_kl exceeds kl_early_stop threshold during any epoch,
+  remaining epochs are skipped. This prevents policy collapse when using more epochs
+  (ppo_epochs=4) while still getting more gradient steps when policy is stable.
 """
 import torch
 import torch.nn as nn
@@ -67,7 +72,7 @@ class PPOTrainer:
             oom_errors = oom_errors + (torch.AcceleratorError,)
 
         with torch.no_grad():
-            next_value = self.net.get_value(rollout["next_obs"])
+            next_value = self.net.get_value(rollout["next_obs"].float())
 
         advantages, returns = self.compute_gae(
             rollout["rewards"], rollout["values"],
@@ -98,14 +103,20 @@ class PPOTrainer:
             b_returns_norm = (b_returns - returns_mean) / returns_std
             b_values_norm = (b_values - returns_mean) / returns_std
 
-        total_pg_loss = 0.0
-        total_v_loss = 0.0
-        total_entropy = 0.0
-        total_clipfrac = 0.0
-        total_approx_kl = 0.0
+        _dev = b_obs.device
+        total_pg_loss = torch.zeros((), device=_dev)
+        total_v_loss = torch.zeros((), device=_dev)
+        total_entropy = torch.zeros((), device=_dev)
+        total_clipfrac = torch.zeros((), device=_dev)
+        total_approx_kl = torch.zeros((), device=_dev)
         n_updates = 0
 
+        kl_early_stopped = False
+
         for epoch in range(cfg.ppo_epochs):
+            if kl_early_stopped:
+                break
+
             perm = torch.randperm(B, device=b_obs.device)
 
             for start in range(0, B, cfg.minibatch_size):
@@ -115,11 +126,11 @@ class PPOTrainer:
                 microbatch_size = max(1, min(cfg.microbatch_size, mb_size))
 
                 while True:
-                    mb_pg_loss = 0.0
-                    mb_v_loss = 0.0
-                    mb_entropy = 0.0
-                    mb_clipfrac = 0.0
-                    mb_approx_kl = 0.0
+                    mb_pg_loss = torch.zeros((), device=_dev)
+                    mb_v_loss = torch.zeros((), device=_dev)
+                    mb_entropy = torch.zeros((), device=_dev)
+                    mb_clipfrac = torch.zeros((), device=_dev)
+                    mb_approx_kl = torch.zeros((), device=_dev)
 
                     self.optimizer.zero_grad(set_to_none=True)
 
@@ -130,7 +141,7 @@ class PPOTrainer:
                             micro_count = micro_end - micro_start
                             micro_weight = micro_count / mb_size
 
-                            mb_obs = b_obs[micro_idx]
+                            mb_obs = b_obs[micro_idx].float()
                             mb_actions = b_actions[micro_idx]
                             mb_old_log_probs = b_log_probs[micro_idx]
                             mb_advantages = b_advantages[micro_idx]
@@ -178,12 +189,12 @@ class PPOTrainer:
                             self.scaler.scale(loss * micro_weight).backward()
 
                             with torch.no_grad():
-                                mb_pg_loss += pg_loss.item() * micro_weight
-                                mb_v_loss += v_loss.item() * micro_weight
-                                mb_entropy += entropy_loss.item() * micro_weight
-                                mb_approx_kl += ((ratio - 1) - log_ratio).mean().item() * micro_weight
+                                mb_pg_loss += pg_loss.detach() * micro_weight
+                                mb_v_loss += v_loss.detach() * micro_weight
+                                mb_entropy += entropy_loss.detach() * micro_weight
+                                mb_approx_kl += ((ratio - 1) - log_ratio).mean().detach() * micro_weight
                                 mb_clipfrac += (
-                                    ((ratio - 1.0).abs() > cfg.clip_eps).float().mean().item()
+                                    ((ratio - 1.0).abs() > cfg.clip_eps).float().mean().detach()
                                     * micro_weight
                                 )
 
@@ -213,16 +224,29 @@ class PPOTrainer:
                 total_approx_kl += mb_approx_kl
                 n_updates += 1
 
+                # v11: KL early stopping — abort remaining epochs if KL divergence
+                # exceeds threshold, preventing policy collapse with more ppo_epochs.
+                # Single sync point per minibatch for KL check (unavoidable for early stopping)
+                _mb_kl = mb_approx_kl.item()
+                if cfg.kl_early_stop > 0 and _mb_kl > cfg.kl_early_stop:
+                    kl_early_stopped = True
+                    break
+
+        # Single GPU→CPU sync point: materialize all accumulated metrics at once
+        _nu = max(n_updates, 1)
         metrics = {
-            "loss/policy": total_pg_loss / max(n_updates, 1),
-            "loss/value": total_v_loss / max(n_updates, 1),
-            "loss/entropy": total_entropy / max(n_updates, 1),
-            "ppo/clipfrac": total_clipfrac / max(n_updates, 1),
-            "ppo/approx_kl": total_approx_kl / max(n_updates, 1),
+            "loss/policy": (total_pg_loss / _nu).item(),
+            "loss/value": (total_v_loss / _nu).item(),
+            "loss/entropy": (total_entropy / _nu).item(),
+            "ppo/clipfrac": (total_clipfrac / _nu).item(),
+            "ppo/approx_kl": (total_approx_kl / _nu).item(),
             "ppo/entropy_coef": entropy_coef,
             # Return normalization diagnostics (v6): monitor scale of raw returns
             "returns/mean": returns_mean.item(),
             "returns/std": returns_std.item(),
+            # v11: KL early stopping diagnostics
+            "ppo/epochs_used": epoch + 1 if not kl_early_stopped else epoch,
+            "ppo/kl_early_stopped": 1.0 if kl_early_stopped else 0.0,
         }
 
         return metrics

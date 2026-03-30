@@ -144,6 +144,81 @@ def prepare_model_state_dict(checkpoint_or_state_dict: Dict[str, Any]) -> tuple[
             state_dict[vfc_key] = new_fc
         print("[checkpoint] Migrated value head: 1 channel -> 4 channels")
 
+    # v11: migrate input conv from old obs_planes (e.g. 19) to new obs_planes (e.g. 58)
+    # This happens when loading a pre-frame-stacking checkpoint into the new architecture.
+    iconv_key = "input_conv.0.weight"
+    if iconv_key in state_dict:
+        old_in_ch = state_dict[iconv_key].shape[1]
+        # Detect expected obs_planes: 12*frame_stack + meta + extra
+        # Default v11: 12*4 + 7 + 3 = 58.  Pre-v11: typically 19.
+        from config import Config as _Cfg
+        _tmp = _Cfg()
+        expected_in_ch = _tmp.obs_planes
+        if old_in_ch != expected_in_ch and old_in_ch < expected_in_ch:
+            migration["input_conv"] = True
+            state_dict = dict(state_dict)
+            old_w = state_dict[iconv_key]  # [F, old_in, 3, 3]
+            F_out = old_w.shape[0]
+            new_w = torch.zeros(F_out, expected_in_ch, 3, 3,
+                                dtype=old_w.dtype, device=old_w.device)
+            torch.nn.init.kaiming_normal_(new_w, mode="fan_out", nonlinearity="relu")
+            new_w[:, :old_in_ch] = old_w  # preserve learned channels
+            state_dict[iconv_key] = new_w
+            # Expand corresponding BatchNorm — shape is [F_out], stays the same
+            print(f"[checkpoint] Migrated input conv: {old_in_ch} -> {expected_in_ch} input channels")
+
+    # v11: migrate value head from 4 channels to 8 channels
+    if vconv_key in state_dict and state_dict[vconv_key].shape[0] == 4:
+        from config import Config as _Cfg2
+        _tmp2 = _Cfg2()
+        target_vch = _tmp2.value_head_channels
+        if target_vch > 4:
+            migration["value_head_v11"] = True
+            state_dict = dict(state_dict)
+            old_conv = state_dict[vconv_key]  # [4, C, 1, 1]
+            C = old_conv.shape[1]
+            new_conv = torch.zeros(target_vch, C, 1, 1,
+                                   dtype=old_conv.dtype, device=old_conv.device)
+            torch.nn.init.kaiming_normal_(new_conv, mode="fan_out", nonlinearity="relu")
+            new_conv[:4] = old_conv  # preserve existing 4 channels
+            state_dict[vconv_key] = new_conv
+            # Expand BatchNorm from 4→target_vch channels
+            for bn_key in [vbn_w_key, vbn_b_key, vbn_rm_key, vbn_rv_key]:
+                if bn_key in state_dict:
+                    old_val = state_dict[bn_key]  # [4]
+                    expanded = old_val.new_zeros(target_vch)
+                    expanded[:4] = old_val
+                    if bn_key == vbn_w_key:
+                        expanded[4:] = 1.0  # BN weight default
+                    elif bn_key == vbn_rv_key:
+                        expanded[4:] = 1.0  # BN running_var default
+                    state_dict[bn_key] = expanded
+            # Expand value FC input from 4*64=256 → target_vch*64
+            if vfc_key in state_dict:
+                old_fc = state_dict[vfc_key]  # [hidden, 256]
+                hidden = old_fc.shape[0]
+                new_in = target_vch * 64
+                if old_fc.shape[1] < new_in:
+                    new_fc = torch.zeros(hidden, new_in,
+                                         dtype=old_fc.dtype, device=old_fc.device)
+                    torch.nn.init.xavier_uniform_(new_fc)
+                    new_fc[:, :old_fc.shape[1]] = old_fc
+                    state_dict[vfc_key] = new_fc
+            print(f"[checkpoint] Migrated value head: 4 -> {target_vch} channels")
+
+    # v11: inject missing attention layer weights (new layer not in old checkpoints)
+    attn_key = "attention.attn.in_proj_weight"
+    if attn_key not in state_dict:
+        # Check if the current default config expects attention
+        from config import Config as _Cfg3
+        _tmp3 = _Cfg3()
+        if _tmp3.use_attention:
+            migration["attention"] = True
+            # Don't inject weights here — let strict=False handle it in load_state_dict,
+            # or let the caller initialize attention from scratch.
+            # We just flag the migration so callers know.
+            print("[checkpoint] Attention layer not in checkpoint — will be initialized from scratch")
+
     migrated = any(migration.values())
     return state_dict, migrated, migration
 
@@ -163,7 +238,9 @@ def load_checkpoint(path: str, network: nn.Module, optimizer: torch.optim.Optimi
     if any(k.startswith("_orig_mod.") for k in model_keys):
         state_dict = {f"_orig_mod.{k}": v for k, v in state_dict.items()}
 
-    network.load_state_dict(state_dict)
+    # v11: use strict=False when new layers (attention) are missing from checkpoint
+    strict = not migration.get("attention", False)
+    network.load_state_dict(state_dict, strict=strict)
     optimizer_state_loaded = False
     if optimizer is not None and "optimizer_state_dict" in ckpt and not migrated:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])

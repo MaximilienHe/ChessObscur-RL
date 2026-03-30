@@ -44,6 +44,9 @@ def load_model(checkpoint_path, cfg, device):
         policy_head_filters=cfg.policy_head_filters,
         value_head_hidden=cfg.value_head_hidden,
         total_actions=cfg.total_actions,
+        value_head_channels=cfg.value_head_channels,
+        use_attention=cfg.use_attention,
+        attention_heads=cfg.attention_heads,
     ).to(device)
 
     ckpt = load_checkpoint(checkpoint_path, network, device=device)
@@ -57,7 +60,8 @@ def load_model(checkpoint_path, cfg, device):
 def run_evaluation(network, cfg, num_games=500, num_envs=256, device="cuda",
                    temperature=0.0, detailed=False):
     num_envs = min(num_envs, num_games)
-    env = ChessObscurEnv(num_envs, device=device, max_steps=300)
+    env = ChessObscurEnv(num_envs, device=device, max_steps=300,
+                         frame_stack=cfg.frame_stack)
     obs = env.reset()
     
     stats = {

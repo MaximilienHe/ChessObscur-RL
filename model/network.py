@@ -1,5 +1,12 @@
 """
-network.py — Actor-Critic ResNet for Chess Obscur.
+network.py — Actor-Critic ResNet with spatial attention for Chess Obscur.
+
+CHANGES v11:
+- SpatialAttention: multi-head self-attention over 8x8 board positions after ResNet trunk.
+  Captures long-range piece interactions (e.g. bishop pin across the board) that
+  local 3x3 convolutions struggle with.
+- Value head channels: configurable (default 8, was 4) for richer spatial representation.
+- obs_planes now dynamic (58 with frame_stack=4 vs 19 previously).
 """
 import torch
 import torch.nn as nn
@@ -22,10 +29,36 @@ class ResBlock(nn.Module):
         return out
 
 
+class SpatialAttention(nn.Module):
+    """Multi-head self-attention over spatial positions (8x8 = 64 tokens).
+
+    Each spatial position is treated as a token with `channels` features.
+    This allows the network to model long-range dependencies between distant
+    squares (e.g. a rook on a1 controlling h1) without stacking many conv layers.
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # Reshape to (B, H*W, C) — each spatial position becomes a token
+        tokens = x.view(B, C, H * W).permute(0, 2, 1)  # (B, 64, C)
+        attn_out, _ = self.attn(tokens, tokens, tokens, need_weights=False)
+        out = self.norm(tokens + attn_out)  # residual + LayerNorm
+        return out.permute(0, 2, 1).contiguous().view(B, C, H, W)
+
+
 class ChessObscurNetwork(nn.Module):
-    def __init__(self, obs_planes: int = 19, num_filters: int = 128,
-                 num_res_blocks: int = 10, policy_head_filters: int = 32,
-                 value_head_hidden: int = 256, total_actions: int = 4099):
+    def __init__(self, obs_planes: int = 58, num_filters: int = 192,
+                 num_res_blocks: int = 15, policy_head_filters: int = 64,
+                 value_head_hidden: int = 1024, total_actions: int = 4099,
+                 value_head_channels: int = 8, use_attention: bool = True,
+                 attention_heads: int = 4):
         super().__init__()
 
         self.input_conv = nn.Sequential(
@@ -38,6 +71,11 @@ class ChessObscurNetwork(nn.Module):
             *[ResBlock(num_filters) for _ in range(num_res_blocks)]
         )
 
+        # v11: optional spatial self-attention after ResNet trunk
+        self.use_attention = use_attention
+        if use_attention:
+            self.attention = SpatialAttention(num_filters, attention_heads)
+
         self.policy_conv = nn.Sequential(
             nn.Conv2d(num_filters, policy_head_filters, 1, bias=False),
             nn.BatchNorm2d(policy_head_filters),
@@ -45,14 +83,14 @@ class ChessObscurNetwork(nn.Module):
         )
         self.policy_fc = nn.Linear(policy_head_filters * 8 * 8, total_actions)
 
-        # v10: 1→4 channels to preserve spatial information
+        # v11: value head channels configurable (default 8, was 4 in v10)
         self.value_conv = nn.Sequential(
-            nn.Conv2d(num_filters, 4, 1, bias=False),
-            nn.BatchNorm2d(4),
+            nn.Conv2d(num_filters, value_head_channels, 1, bias=False),
+            nn.BatchNorm2d(value_head_channels),
             nn.ReLU(),
         )
         self.value_fc = nn.Sequential(
-            nn.Linear(4 * 8 * 8, value_head_hidden),
+            nn.Linear(value_head_channels * 8 * 8, value_head_hidden),
             nn.ReLU(),
             nn.Linear(value_head_hidden, 1),
             # No Tanh: returns can exceed [-1,1] with intermediate rewards accumulated
@@ -72,10 +110,17 @@ class ChessObscurNetwork(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, obs: torch.Tensor, legal_mask: torch.Tensor = None):
         x = self.input_conv(obs)
         x = self.res_blocks(x)
+
+        # v11: spatial attention for long-range dependencies
+        if self.use_attention:
+            x = self.attention(x)
 
         p = self.policy_conv(x)
         p = p.view(p.size(0), -1)
@@ -107,6 +152,8 @@ class ChessObscurNetwork(nn.Module):
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         x = self.input_conv(obs)
         x = self.res_blocks(x)
+        if self.use_attention:
+            x = self.attention(x)
         v = self.value_conv(x)
         v = v.view(v.size(0), -1)
         return self.value_fc(v).squeeze(-1)

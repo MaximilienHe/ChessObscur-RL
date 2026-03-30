@@ -1,25 +1,33 @@
 """
 config.py — All hyperparameters for Chess Obscur PPO training.
 
+CHANGES v11 (frame stacking + attention + attack planes + MCTS + tuning):
+- FRAME STACKING: 4-frame history of piece planes for temporal awareness.
+  obs_planes: 19 -> 58 (12 piece planes * 4 frames + 7 metadata + 3 new).
+- NEW OBS PLANES: friendly/enemy x-ray attack maps + normalized move number.
+- NETWORK: Spatial self-attention layer after ResNet trunk for long-range patterns.
+- NETWORK: Value head channels 4 -> 8 for richer spatial representation.
+- PPO: KL early stopping (threshold 0.02) replaces fixed epoch count.
+- PPO: ppo_epochs 3 -> 4 (more updates with KL safety net).
+- ENTROPY: Faster decay (600M steps, was 800M) — network is stronger with stacking.
+- MCTS: Optional tree search at inference (num_simulations configurable).
+- ROLLOUT: Obs stored in float16 to offset memory from larger obs tensor.
+
+CHANGES v10 (training dynamics + value head):
+- FIX: full_move_count only increments on PHASE_MOVE (not defense/parry).
+- Value head channels 1->4 for spatial info preservation.
+- Curriculum cap 180->220 for endgame learning.
+- LR restart decay 0.5->0.7 to keep LR active longer.
+
 CHANGES v8 (fresh start — audit from 493M step run):
 - NETWORK: 10 blocks / 128 filters -> 15 blocks / 192 filters (~8.5M params vs ~2.5M)
-  Bigger network = more capacity, less likely to plateau early.
 - LR: linear decay to 0 -> cosine annealing with warm restarts + lr_min floor (3e-5).
-  Linear decay killed training after ~200M steps (clipfrac=0, KL=0, LR≈0).
 - LR WARM RESTARTS: every 100M steps, LR resets to lr * 0.5 (decaying ceiling).
-  This periodically re-injects learning capacity to escape local optima.
 - LEAGUE TRAINING: 30% of games played against random past checkpoints.
-  Breaks the Nash draw equilibrium (79% draws) by forcing exploitation of weaker policies.
 - REWARD: progressive draw penalty based on game duration (see reward.py).
 - REWARD: parry good_move 0.15->0.30, parry skip -0.03->-0.08 (parry under-exploited).
 - value_head_hidden: 512 -> 1024 (bigger value head for bigger backbone).
 - policy_head_filters: 32 -> 64 (match bigger backbone).
-
-CHANGES v7 (draw penalty + training throughput — resume from 122M checkpoint):
-- clip_eps: 0.10 -> 0.12 (clipfrac trop bas à 0.043, le modèle sous-apprend)
-- ppo_epochs: 2 -> 3 (clipfrac bas = signal qu'on peut se permettre plus de passes)
-- curriculum_max_steps_cap: 250 -> 180 (parties trop longues = draw via 50-move rule)
-- REWARD_WIN: 1.5 -> 2.0, REWARD_DRAW: -0.8 -> -1.3 (voir reward.py)
 
 CHANGES v6 (training stability fix — diagnosed from TensorBoard logs):
 - ROOT CAUSE FOUND: tanh on value head bounded predictions to [-1,1] but GAE returns
@@ -27,16 +35,6 @@ CHANGES v6 (training stability fix — diagnosed from TensorBoard logs):
   and policy collapse from 85% win rate to 18% in one run.
 - value head tanh REMOVED in network.py (linear output now).
 - Return normalization added in ppo.py (targets normalized per-update batch).
-- clip_eps: 0.18 -> 0.10 (approx_kl was exploding to 0.23, needed tighter clip)
-- ppo_epochs: 4 -> 2 (fewer passes = less cumulative policy drift per rollout)
-- num_minibatches: 6 -> 8 (smaller minibatches = more gradient steps but each is smaller)
-- entropy_coef: 0.008 -> 0.015 (entropy died to 1.12 nats, need stronger push)
-- entropy_coef_min: 0.003 -> 0.008 (higher floor, never let entropy die again)
-- entropy_coef_decay_steps: 400M -> 800M (much slower decay)
-- value_coef: 0.25 -> 0.25 (unchanged; with normalized targets it's already appropriate)
-- REWARD: REWARD_CHECK_3RD_CAPTURE_PENALTY removed (was penalizing valid captures)
-- REWARD: outcome-based check escape reward added (see reward.py / chess_obscur_env.py)
-- REWARD: REWARD_PARRY_SELF_CAPTURE: -0.30 -> -0.80 (model was at 1.3% then regressed to 7%)
 """
 import math
 from dataclasses import dataclass, field
@@ -62,10 +60,14 @@ class Config:
     curriculum_start_steps: int = 150
     curriculum_step_increase: int = 10
     curriculum_every_n_timesteps: int = 5_000_000  # every 5M timesteps
-    curriculum_max_steps_cap: int = 220  # v10: 180→220, longer games for endgame learning
+    curriculum_max_steps_cap: int = 220
 
-    # ── Observation ──
-    obs_planes: int = 19
+    # ── Observation v11: frame stacking + attack planes + move number ──
+    frame_stack: int = 4           # v11: stack last N board states for temporal awareness
+    piece_planes: int = 12         # 6 friendly + 6 enemy piece types per frame
+    meta_planes: int = 7           # en_passant, castling, turn, check, phase, check_attempts, half_moves
+    extra_planes: int = 3          # v11: friendly_attacks, enemy_attacks, move_number
+    obs_planes: int = -1           # computed: piece_planes * frame_stack + meta_planes + extra_planes
     board_size: int = 8
 
     # ── Action space ──
@@ -74,40 +76,45 @@ class Config:
     total_actions: int = 4099       # 4096 + 3
 
     # ── Defense action indices ──
-    defense_offset: int = 4096      # immediately after board actions
+    defense_offset: int = 4096
     ACTION_ATTEMPT_BLOCK: int = 4096
     ACTION_ATTEMPT_PARRY: int = 4097
     ACTION_ACCEPT_LOSS: int = 4098
 
-    # ── Network v8 ──
-    num_res_blocks: int = 15         # v8: 10 -> 15
-    num_filters: int = 192           # v8: 128 -> 192
-    value_head_hidden: int = 1024    # v8: 512 -> 1024
-    policy_head_filters: int = 64    # v8: 32 -> 64
+    # ── Network v11 ──
+    num_res_blocks: int = 15
+    num_filters: int = 192
+    value_head_hidden: int = 1024
+    value_head_channels: int = 8     # v11: 4 -> 8 (richer spatial info for value estimation)
+    policy_head_filters: int = 64
+    use_attention: bool = True       # v11: spatial self-attention after ResNet trunk
+    attention_heads: int = 4         # v11: number of attention heads
 
-    # ── PPO ──
+    # ── PPO v11 ──
     lr: float = 3e-4
-    lr_min: float = 3e-5            # v8: LR floor (never go to zero)
-    lr_warmup_steps: int = 1_000_000  # v8: linear warmup over first 1M steps
-    lr_restart_period: int = 100_000_000  # v8: cosine restart every 100M steps
-    lr_restart_decay: float = 0.7    # v10: 0.5→0.7, less aggressive decay (LR stayed active longer)
+    lr_min: float = 3e-5
+    lr_warmup_steps: int = 1_000_000
+    lr_restart_period: int = 100_000_000
+    lr_restart_decay: float = 0.7
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.12
     clip_value: float = 1.0
     entropy_coef: float = 0.015
     entropy_coef_min: float = 0.008
-    entropy_coef_decay_steps: int = 800_000_000
+    entropy_coef_decay_steps: int = 600_000_000  # v11: 800M→600M, faster decay with stronger obs
     value_coef: float = 0.25
     max_grad_norm: float = 0.5
-    ppo_epochs: int = 3
+    ppo_epochs: int = 4              # v11: 3→4 (more updates with KL early stopping safety net)
+    kl_early_stop: float = 0.02      # v11: stop PPO epochs if approx_kl exceeds this
     num_minibatches: int = 8
+    obs_dtype_fp16: bool = True       # v11: store obs in float16 in rollout buffer
 
     # ── Rollout ──
-    rollout_steps: int = 256         # steps per env before PPO update
-    batch_size: int = -1             # computed = num_envs * rollout_steps
-    minibatch_size: int = -1         # computed = batch_size / num_minibatches
-    microbatch_size: int = 8192      # larger for RTX 5090
+    rollout_steps: int = 256
+    batch_size: int = -1
+    minibatch_size: int = -1
+    microbatch_size: int = 8192
 
     # ── Training schedule ──
     total_timesteps: int = 500_000_000
@@ -117,9 +124,15 @@ class Config:
 
     # ── League training v8 ──
     league_enabled: bool = True
-    league_frac: float = 0.30         # 30% of envs play against past checkpoints
-    league_checkpoint_interval: int = 10_000_000  # snapshot every 10M steps
-    league_max_checkpoints: int = 10  # keep last N snapshots in the pool
+    league_frac: float = 0.30
+    league_checkpoint_interval: int = 10_000_000
+    league_max_checkpoints: int = 10
+
+    # ── MCTS v11 (inference only) ──
+    mcts_enabled: bool = False
+    mcts_num_simulations: int = 50
+    mcts_c_puct: float = 1.5
+    mcts_temperature: float = 0.0   # 0 = pick best, >0 = sample proportional to visits
 
     # ── Warmstart (behavioral cloning from website games) ──
     warmstart_file: Optional[str] = None
@@ -133,7 +146,7 @@ class Config:
 
     # ── Piece stats (from chess.js PIECE_STATS) ──
     piece_attack: dict = field(default_factory=lambda: {
-        0: 1, 1: 3, 2: 3, 3: 5, 4: 9, 5: 10   # p,n,b,r,q,k
+        0: 1, 1: 3, 2: 3, 3: 5, 4: 9, 5: 10
     })
     piece_defense: dict = field(default_factory=lambda: {
         0: 1, 1: 3, 2: 3, 3: 7, 4: 8, 5: 10
@@ -143,6 +156,8 @@ class Config:
     })
 
     def __post_init__(self):
+        # v11: compute obs_planes dynamically from frame_stack
+        self.obs_planes = self.piece_planes * self.frame_stack + self.meta_planes + self.extra_planes
         self.batch_size = self.num_envs * self.rollout_steps
         self.minibatch_size = self.batch_size // self.num_minibatches
         if self.microbatch_size <= 0:
@@ -151,13 +166,7 @@ class Config:
             self.microbatch_size = min(self.microbatch_size, self.minibatch_size)
 
     def get_lr(self, global_step: int) -> float:
-        """Cosine annealing with warm restarts and decaying ceiling.
-
-        - Linear warmup for the first lr_warmup_steps.
-        - After warmup: cosine annealing from lr_max to lr_min over lr_restart_period.
-        - At each restart boundary, lr_max is multiplied by lr_restart_decay.
-        - Never goes below lr_min.
-        """
+        """Cosine annealing with warm restarts and decaying ceiling."""
         if global_step < self.lr_warmup_steps:
             return self.lr_min + (self.lr - self.lr_min) * (global_step / self.lr_warmup_steps)
 
@@ -172,7 +181,7 @@ class Config:
         return self.lr_min + 0.5 * (lr_max - self.lr_min) * (1 + math.cos(math.pi * progress_in_cycle))
 
     def get_entropy_coef(self, global_step: int) -> float:
-        """Decay linéaire de l'entropy coef de entropy_coef vers entropy_coef_min."""
+        """Linear decay from entropy_coef to entropy_coef_min."""
         if global_step >= self.entropy_coef_decay_steps:
             return self.entropy_coef_min
         progress = global_step / self.entropy_coef_decay_steps

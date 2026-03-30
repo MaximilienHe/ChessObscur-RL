@@ -107,7 +107,8 @@ def evaluate(network: ChessObscurNetwork, cfg: Config, num_games: int = 100):
     print(f"\n[eval] Running {num_games} evaluation games...")
     device = cfg.device
     num_envs = min(num_games, cfg.num_envs)
-    env = ChessObscurEnv(num_envs, device=device, max_steps=cfg.max_game_steps)
+    env = ChessObscurEnv(num_envs, device=device, max_steps=cfg.max_game_steps,
+                         frame_stack=cfg.frame_stack)
 
     obs = env.reset()
     network.eval()
@@ -170,6 +171,11 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
     print(f"  PPO epochs: {cfg.ppo_epochs}")
     print(f"  Max game steps: {cfg.max_game_steps}")
     print(f"  Curriculum cap: {cfg.curriculum_max_steps_cap}")
+    print(f"  Frame stack:  {cfg.frame_stack}")
+    print(f"  Obs planes:   {cfg.obs_planes}")
+    print(f"  Attention:    {'ON' if cfg.use_attention else 'OFF'}")
+    print(f"  KL early stop: {cfg.kl_early_stop}")
+    print(f"  Obs dtype:    {'fp16' if cfg.obs_dtype_fp16 else 'fp32'}")
     print(f"  Entropy coef: {cfg.entropy_coef} → {cfg.entropy_coef_min} over {cfg.entropy_coef_decay_steps:,} steps")
     print(f"  LR schedule: cosine annealing, lr={cfg.lr} → lr_min={cfg.lr_min}, "
           f"restart every {cfg.lr_restart_period:,} steps (decay={cfg.lr_restart_decay})")
@@ -185,6 +191,9 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
         policy_head_filters=cfg.policy_head_filters,
         value_head_hidden=cfg.value_head_hidden,
         total_actions=cfg.total_actions,
+        value_head_channels=cfg.value_head_channels,
+        use_attention=cfg.use_attention,
+        attention_heads=cfg.attention_heads,
     ).to(device)
 
     param_count = sum(p.numel() for p in network.parameters())
@@ -245,12 +254,14 @@ def train(cfg: Config, resume: str = None, warmstart: str = None):
 
     # Initialize environment with curriculum starting value if enabled
     initial_max_steps = cfg.curriculum_start_steps if cfg.curriculum_enabled else cfg.max_game_steps
-    env = ChessObscurEnv(cfg.num_envs, device=device, max_steps=initial_max_steps)
+    env = ChessObscurEnv(cfg.num_envs, device=device, max_steps=initial_max_steps,
+                         frame_stack=cfg.frame_stack)
     obs = env.reset()
 
     obs_shape = (cfg.obs_planes, cfg.board_size, cfg.board_size)
     buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, obs_shape,
-                           cfg.total_actions, device)
+                           cfg.total_actions, device,
+                           obs_fp16=cfg.obs_dtype_fp16)
 
     logger = Logger(log_dir=cfg.log_dir)
 
@@ -427,6 +438,9 @@ def main():
             policy_head_filters=cfg.policy_head_filters,
             value_head_hidden=cfg.value_head_hidden,
             total_actions=cfg.total_actions,
+            value_head_channels=cfg.value_head_channels,
+            use_attention=cfg.use_attention,
+            attention_heads=cfg.attention_heads,
         ).to(cfg.device)
 
         ckpt = args.checkpoint or args.resume

@@ -1,14 +1,17 @@
 """
 self_play.py — Self-play rollout collection.
 
+CHANGES v11:
+- RolloutBuffer stores obs in float16 when obs_dtype_fp16=True (saves ~50% VRAM).
+  With frame_stack=4 the obs tensor grows from (19,8,8) to (58,8,8);
+  float16 storage keeps total VRAM under control on 32GB GPUs.
+- Obs are cast to float32 only when consumed by the network (via AMP autocast).
+
 CHANGES v8:
 - League training support: some envs play against past checkpoints.
-  When it's the opponent's turn in a league env, the opponent network picks
-  the action. The learning network still evaluates all states for PPO.
 
 CHANGES v5:
 - Removed all parry/enemy_capture stats (illegal move removed)
-- Parry stats now track only 3 outcomes: skip, good_move, self_capture
 """
 import torch
 import time
@@ -21,16 +24,20 @@ from utils.bitpack import pack_action_mask, packed_num_bytes
 
 
 class RolloutBuffer:
-    """Stores rollout data on GPU."""
+    """Stores rollout data on GPU. v11: supports float16 obs storage."""
 
-    def __init__(self, T: int, N: int, obs_shape: Tuple, num_actions: int, device: str):
+    def __init__(self, T: int, N: int, obs_shape: Tuple, num_actions: int,
+                 device: str, obs_fp16: bool = True):
         self.T = T
         self.N = N
         self.num_actions = num_actions
         self.packed_mask_bytes = packed_num_bytes(num_actions)
         self.device = torch.device(device)
+        self.obs_fp16 = obs_fp16
 
-        self.obs = torch.zeros(T, N, *obs_shape, device=self.device)
+        # v11: store obs in float16 to save VRAM with larger observation tensors
+        obs_dtype = torch.float16 if obs_fp16 else torch.float32
+        self.obs = torch.zeros(T, N, *obs_shape, dtype=obs_dtype, device=self.device)
         self.actions = torch.zeros(T, N, dtype=torch.int64, device=self.device)
         self.log_probs = torch.zeros(T, N, device=self.device)
         self.rewards = torch.zeros(T, N, device=self.device)
@@ -44,7 +51,8 @@ class RolloutBuffer:
 
     def insert(self, obs, actions, log_probs, rewards, dones, values, legal_masks):
         t = self.step
-        self.obs[t] = obs
+        # v11: cast to storage dtype (float16 if enabled)
+        self.obs[t] = obs.to(self.obs.dtype)
         self.actions[t] = actions
         self.log_probs[t] = log_probs
         self.rewards[t] = rewards
@@ -55,6 +63,7 @@ class RolloutBuffer:
 
     def get(self, next_obs: torch.Tensor) -> Dict[str, torch.Tensor]:
         self.step = 0
+        # v11: keep obs in fp16 — cast to float32 per-microbatch in PPO (saves ~6.8 GB peak VRAM)
         return {
             "obs": self.obs,
             "actions": self.actions,
@@ -84,24 +93,27 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
     Returns: (next_obs, stats_dict)
     """
     T = buffer.T
-    games_completed = 0
-    total_rewards = torch.zeros((), device=obs.device)
-    white_wins = 0
-    black_wins = 0
-    draws = 0
+    _dev = obs.device
+    games_completed = torch.zeros((), dtype=torch.int64, device=_dev)
+    total_rewards = torch.zeros((), device=_dev)
+    white_wins = torch.zeros((), dtype=torch.int64, device=_dev)
+    black_wins = torch.zeros((), dtype=torch.int64, device=_dev)
+    draws = torch.zeros((), dtype=torch.int64, device=_dev)
 
-    white_reward_sum = torch.zeros((), device=obs.device)
-    black_reward_sum = torch.zeros((), device=obs.device)
-    white_reward_count = torch.zeros((), dtype=torch.int64, device=obs.device)
-    black_reward_count = torch.zeros((), dtype=torch.int64, device=obs.device)
+    white_reward_sum = torch.zeros((), device=_dev)
+    black_reward_sum = torch.zeros((), device=_dev)
+    white_reward_count = torch.zeros((), dtype=torch.int64, device=_dev)
+    black_reward_count = torch.zeros((), dtype=torch.int64, device=_dev)
 
-    phase_counts = torch.zeros(3, dtype=torch.int64, device=obs.device)
-    total_legal_actions = torch.zeros((), dtype=torch.int64, device=obs.device)
-    game_lengths = []
+    phase_counts = torch.zeros(3, dtype=torch.int64, device=_dev)
+    total_legal_actions = torch.zeros((), dtype=torch.int64, device=_dev)
+    game_length_sum = torch.zeros((), dtype=torch.int64, device=_dev)
+    game_length_max = torch.zeros((), dtype=torch.int64, device=_dev)
+    game_length_min = torch.full((), 999999, dtype=torch.int64, device=_dev)
 
     # v8: league win tracking
-    league_games = 0
-    league_wins = 0
+    league_games = torch.zeros((), dtype=torch.int64, device=_dev)
+    league_wins = torch.zeros((), dtype=torch.int64, device=_dev)
 
     use_league = (opponent_net is not None and league_mask is not None
                   and league_mask.any())
@@ -128,7 +140,6 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
 
             # v8 league: override actions for league envs when it's the opponent's turn
             if use_league:
-                # Opponent's turn = when current active player is NOT the agent
                 is_opponent_turn = env.turn_is_white != env.agent_is_white
                 opp_envs = league_mask & is_opponent_turn
 
@@ -156,65 +167,69 @@ def collect_rollout(env: ChessObscurEnv, network: ChessObscurNetwork,
             black_reward_count += black_mask.sum()
 
             if done.any():
-                n_done = done.sum().item()
+                n_done = done.sum()
                 games_completed += n_done
                 results = info["result"][done]
-                white_wins += (results == 1).sum().item()
-                black_wins += (results == 2).sum().item()
-                draws += (results == 3).sum().item()
+                white_wins += (results == 1).sum()
+                black_wins += (results == 2).sum()
+                draws += (results == 3).sum()
 
                 move_counts = info["full_move_count"][done]
-                for mc in move_counts:
-                    game_lengths.append(mc.item())
+                game_length_sum += move_counts.sum()
+                game_length_max = torch.max(game_length_max, move_counts.max())
+                game_length_min = torch.min(game_length_min, move_counts.min())
 
                 # v8: track league-specific win rate
                 if use_league:
                     done_league = done & league_mask
                     if done_league.any():
-                        league_games += done_league.sum().item()
+                        league_games += done_league.sum()
                         league_results = info["result"][done_league]
                         league_agent_white = env.agent_is_white[done_league]
                         agent_wins = ((league_results == 1) & league_agent_white) | \
                                      ((league_results == 2) & ~league_agent_white)
-                        league_wins += agent_wins.sum().item()
+                        league_wins += agent_wins.sum()
 
             total_rewards += reward.sum()
             obs = next_obs
 
     network.train()
 
+    # Single GPU→CPU sync: materialize all stats at once
     total_steps = T * env.N
-    move_phases_seen = phase_counts[0].item()
-    defense_phases_seen = phase_counts[1].item()
-    parry_phases_seen = phase_counts[2].item()
+    _gc = games_completed.item()
+    _ww = white_wins.item()
+    _bw = black_wins.item()
+    _dr = draws.item()
+    _pc = phase_counts.tolist()
     stats = {
-        "rollout/games_completed": games_completed,
+        "rollout/games_completed": _gc,
         "rollout/mean_reward": total_rewards.item() / total_steps,
-        "rollout/white_wins": white_wins,
-        "rollout/black_wins": black_wins,
-        "rollout/draws": draws,
-        "rollout/phase_move_frac": move_phases_seen / total_steps,
-        "rollout/phase_defense_frac": defense_phases_seen / total_steps,
-        "rollout/phase_parry_frac": parry_phases_seen / total_steps,
+        "rollout/white_wins": _ww,
+        "rollout/black_wins": _bw,
+        "rollout/draws": _dr,
+        "rollout/phase_move_frac": _pc[0] / total_steps,
+        "rollout/phase_defense_frac": _pc[1] / total_steps,
+        "rollout/phase_parry_frac": _pc[2] / total_steps,
         "rollout/avg_legal_actions": total_legal_actions.item() / total_steps,
         "rollout/white_mean_reward": white_reward_sum.item() / max(white_reward_count.item(), 1),
         "rollout/black_mean_reward": black_reward_sum.item() / max(black_reward_count.item(), 1),
     }
 
-    if games_completed > 0:
-        stats["game/win_rate"] = (white_wins + black_wins) / games_completed
-        stats["game/draw_rate"] = draws / games_completed
-        stats["game/white_win_rate"] = white_wins / games_completed
-        stats["game/black_win_rate"] = black_wins / games_completed
-    if game_lengths:
-        stats["game/avg_length"] = sum(game_lengths) / len(game_lengths)
-        stats["game/max_length"] = max(game_lengths)
-        stats["game/min_length"] = min(game_lengths)
+    if _gc > 0:
+        stats["game/win_rate"] = (_ww + _bw) / _gc
+        stats["game/draw_rate"] = _dr / _gc
+        stats["game/white_win_rate"] = _ww / _gc
+        stats["game/black_win_rate"] = _bw / _gc
+        stats["game/avg_length"] = game_length_sum.item() / _gc
+        stats["game/max_length"] = game_length_max.item()
+        stats["game/min_length"] = game_length_min.item()
 
     # v8: league stats
-    if league_games > 0:
-        stats["league/games"] = league_games
-        stats["league/win_rate"] = league_wins / league_games
+    _lg = league_games.item()
+    if _lg > 0:
+        stats["league/games"] = _lg
+        stats["league/win_rate"] = league_wins.item() / _lg
         stats["league/pool_size"] = 0  # filled in by train.py
 
     # ── Parry stats: 3 outcomes only (skip, good_move, self_capture) ──

@@ -81,6 +81,9 @@ class LeaguePool:
             policy_head_filters=self.cfg.policy_head_filters,
             value_head_hidden=self.cfg.value_head_hidden,
             total_actions=self.cfg.total_actions,
+            value_head_channels=self.cfg.value_head_channels,
+            use_attention=self.cfg.use_attention,
+            attention_heads=self.cfg.attention_heads,
         ).to(self.cfg.device)
         net.eval()
         for p in net.parameters():
@@ -96,15 +99,15 @@ class LeaguePool:
         if global_step < self.snapshot_interval:
             return
 
-        # Save state_dict to CPU
+        # Save state_dict on same device (avoids CPU→GPU transfer on each load)
         state_dict = network.state_dict()
         # Strip _orig_mod. prefix from torch.compile()
-        cpu_state = {}
+        snapshot_state = {}
         for k, v in state_dict.items():
             clean_key = k.replace("_orig_mod.", "")
-            cpu_state[clean_key] = v.cpu().clone()
+            snapshot_state[clean_key] = v.detach().clone()
 
-        self._snapshots.append((global_step, cpu_state))
+        self._snapshots.append((global_step, snapshot_state))
         self._trim_snapshots()
 
         self._last_snapshot_step = global_step
